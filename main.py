@@ -102,7 +102,7 @@ def load_checkpoint(path):
 def build_loader(dataset, args, distributed, shuffle=True):
     """Create DataLoader with optional DistributedSampler."""
     if distributed:
-        sampler = data.distributed.DistributedSampler(dataset, shuffle=shuffle, drop_last=True)
+        sampler = data.distributed.DistributedSampler(dataset, shuffle=shuffle, drop_last=False)
         loader = data.DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
                                  num_workers=args.num_workers, pin_memory=True)
     else:
@@ -233,6 +233,10 @@ def main():
     rf_loader, rf_sampler = build_loader(rf_dataset, args, is_distributed, shuffle=True)
     cwsf_pair_loader_fogpass, cwsf_pair_sampler_fogpass = build_loader(cwsf_fogpass_dataset, args, is_distributed, shuffle=True)
     rf_loader_fogpass, rf_sampler_fogpass = build_loader(rf_fogpass_dataset, args, is_distributed, shuffle=True)
+
+    if is_main_process:
+        print(f"start_iter={start_iter}, num_steps={args.num_steps}, num_steps_stop={args.num_steps_stop}")
+        print(f"len cwsf_dataset={len(cwsf_dataset)}, len rf_dataset={len(rf_dataset)}")
 
     rf_loader_iter = iter(rf_loader)
     cwsf_pair_loader_iter = iter(cwsf_pair_loader)
