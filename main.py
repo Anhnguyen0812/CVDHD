@@ -271,20 +271,22 @@ def main():
             
             batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
             rf_img,rf_size, rf_name = batch_rf
-            with amp.autocast(enabled=bool(args.amp)):
-                img_rf = Variable(rf_img).to(device)
-                feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf) 
+            # Use torch.no_grad for model forward in fogpass phase since model is frozen
+            with torch.no_grad():
+                with amp.autocast(enabled=bool(args.amp)):
+                    img_rf = rf_img.to(device)
+                    feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf) 
 
-                images = Variable(sf_image).to(device)
-                feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images)
+                    images = sf_image.to(device)
+                    feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images)
 
-                images_cw = Variable(cw_image).to(device)
-                feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
+                    images_cw = cw_image.to(device)
+                    feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
 
             fsm_weights = {'layer0':0.5, 'layer1':0.5}
-            sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}                
-            cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
-            rf_features = {'layer0':feature_rf0, 'layer1':feature_rf1}
+            sf_features = {'layer0':feature_sf0.detach(), 'layer1':feature_sf1.detach()}                
+            cw_features = {'layer0':feature_cw0.detach(), 'layer1':feature_cw1.detach()}
+            rf_features = {'layer0':feature_rf0.detach(), 'layer1':feature_rf1.detach()}
 
             total_fpf_loss = 0
 
