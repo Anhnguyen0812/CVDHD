@@ -304,39 +304,30 @@ def main():
                 fogpassfilter.train()  
                 fogpassfilter_optimizer.zero_grad()
                 
-                sf_gram = [0]*args.batch_size
-                cw_gram = [0]*args.batch_size
-                rf_gram = [0]*args.batch_size 
-                vector_sf_gram = [0]*args.batch_size
-                vector_cw_gram = [0]*args.batch_size
-                vector_rf_gram  = [0]*args.batch_size
-                fog_factor_sf = [0]*args.batch_size
-                fog_factor_cw = [0]*args.batch_size
-                fog_factor_rf = [0]*args.batch_size
+                # Dynamic batch size handling
+                actual_batch = sf_feature.size(0)
+                fog_factor_list = []
+                fog_factor_labels_list = []
+                
+                for batch_idx in range(actual_batch):
+                    sf_g = gram_matrix(sf_feature[batch_idx])
+                    cw_g = gram_matrix(cw_feature[batch_idx])
+                    rf_g = gram_matrix(rf_feature[batch_idx])
 
-                for batch_idx in range(args.batch_size):
-                    sf_gram[batch_idx] = gram_matrix(sf_feature[batch_idx])
-                    cw_gram[batch_idx] = gram_matrix(cw_feature[batch_idx])
-                    rf_gram[batch_idx] = gram_matrix(rf_feature[batch_idx])
+                    vec_sf = Variable(sf_g[torch.triu(torch.ones(sf_g.size(0), sf_g.size(1))) == 1], requires_grad=True)
+                    vec_cw = Variable(cw_g[torch.triu(torch.ones(cw_g.size(0), cw_g.size(1))) == 1], requires_grad=True)
+                    vec_rf = Variable(rf_g[torch.triu(torch.ones(rf_g.size(0), rf_g.size(1))) == 1], requires_grad=True)
 
-                    vector_sf_gram[batch_idx] = Variable(sf_gram[batch_idx][torch.triu(torch.ones(sf_gram[batch_idx].size()[0], sf_gram[batch_idx].size()[1])) == 1], requires_grad=True)
-                    vector_cw_gram[batch_idx] = Variable(cw_gram[batch_idx][torch.triu(torch.ones(cw_gram[batch_idx].size()[0], cw_gram[batch_idx].size()[1])) == 1], requires_grad=True)
-                    vector_rf_gram[batch_idx] = Variable(rf_gram[batch_idx][torch.triu(torch.ones(rf_gram[batch_idx].size()[0], rf_gram[batch_idx].size()[1])) == 1], requires_grad=True)
+                    fog_factor_list.append(fogpassfilter(vec_sf).unsqueeze(0))
+                    fog_factor_list.append(fogpassfilter(vec_cw).unsqueeze(0))
+                    fog_factor_list.append(fogpassfilter(vec_rf).unsqueeze(0))
+                    fog_factor_labels_list.extend([0, 1, 2])
 
-                    fog_factor_sf[batch_idx] = fogpassfilter(vector_sf_gram[batch_idx])
-                    fog_factor_cw[batch_idx] = fogpassfilter(vector_cw_gram[batch_idx])
-                    fog_factor_rf[batch_idx] = fogpassfilter(vector_rf_gram[batch_idx])                                                                                                                                                                                                
-
-                fog_factor_embeddings = torch.cat((torch.unsqueeze(fog_factor_sf[0],0),torch.unsqueeze(fog_factor_cw[0],0),torch.unsqueeze(fog_factor_rf[0],0),
-                                                   torch.unsqueeze(fog_factor_sf[1],0),torch.unsqueeze(fog_factor_cw[1],0),torch.unsqueeze(fog_factor_rf[1],0),
-                                                   torch.unsqueeze(fog_factor_sf[2],0),torch.unsqueeze(fog_factor_cw[2],0),torch.unsqueeze(fog_factor_rf[2],0),
-                                                   torch.unsqueeze(fog_factor_sf[3],0),torch.unsqueeze(fog_factor_cw[3],0),torch.unsqueeze(fog_factor_rf[3],0)),0)
-
+                fog_factor_embeddings = torch.cat(fog_factor_list, dim=0)
                 fog_factor_embeddings_norm = torch.norm(fog_factor_embeddings, p=2, dim=1).detach()
-                size_fog_factor = fog_factor_embeddings.size()
-                fog_factor_embeddings = fog_factor_embeddings.div(fog_factor_embeddings_norm.expand(size_fog_factor[1],12).t())
-                fog_factor_labels = torch.LongTensor([0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2])
-                fog_pass_filter_loss = fogpassfilter_loss(fog_factor_embeddings,fog_factor_labels)
+                fog_factor_embeddings = fog_factor_embeddings / fog_factor_embeddings_norm.unsqueeze(1).clamp(min=1e-6)
+                fog_factor_labels = torch.LongTensor(fog_factor_labels_list).to(device)
+                fog_pass_filter_loss = fogpassfilter_loss(fog_factor_embeddings, fog_factor_labels)
 
                 total_fpf_loss +=  fog_pass_filter_loss 
               
