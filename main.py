@@ -42,6 +42,8 @@ def loss_calc(pred, label, device):
     return criterion(pred, label)
 
 def gram_matrix(tensor):
+    # Force float32 to avoid half/float matmul mismatch under AMP
+    tensor = tensor.float()
     d, h, w = tensor.size()
     tensor = tensor.view(d, h*w)
     gram = torch.mm(tensor, tensor.t())
