@@ -18,6 +18,7 @@ INPUT_SIZE_RF = '1920,1080'
 NUM_CLASSES = 19 
 NUM_STEPS = 100000 
 NUM_STEPS_STOP = 60000  # early stopping
+RESUME_STEPS = 5000
 RANDOM_SEED = 1234
 RESTORE_FROM = 'no_model'
 RESTORE_FROM_fogpass = 'no_model'
@@ -46,6 +47,8 @@ def get_arguments():
     parser.add_argument("--num-classes", type=int, default=NUM_CLASSES)
     parser.add_argument("--num-steps", type=int, default=NUM_STEPS)
     parser.add_argument("--num-steps-stop", type=int, default=NUM_STEPS_STOP)
+    parser.add_argument("--resume-steps", type=int, default=RESUME_STEPS,
+                        help="If resuming past num_steps, run this many additional steps")
     parser.add_argument("--random-seed", type=int, default=RANDOM_SEED)
     parser.add_argument("--restore-from", type=str, default=RESTORE_FROM)
     parser.add_argument("--restore-from-fogpass", type=str, default=RESTORE_FROM_fogpass)
