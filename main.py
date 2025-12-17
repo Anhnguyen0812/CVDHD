@@ -9,6 +9,9 @@ import torch.optim as optim
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.autograd import grad 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.cuda import amp
 
 import numpy as np
 import random
@@ -33,9 +36,9 @@ IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32
 RESTORE_FROM = 'without_pretraining'
 RESTORE_FROM_fogpass = 'without_pretraining'
 
-def loss_calc(pred, label, gpu):
-    label = Variable(label.long()).cuda(gpu)
-    criterion = CrossEntropy2d().cuda(gpu)
+def loss_calc(pred, label, device):
+    label = Variable(label.long()).to(device)
+    criterion = CrossEntropy2d().to(device)
     return criterion(pred, label)
 
 def gram_matrix(tensor):
@@ -76,23 +79,66 @@ def make_list(x):
     else:
         return [x]
 
+
+def get_state_dict(module):
+    """Return state_dict handling DDP wrapping."""
+    return module.module.state_dict() if isinstance(module, DDP) else module.state_dict()
+
+
+def build_loader(dataset, args, distributed, shuffle=True):
+    """Create DataLoader with optional DistributedSampler."""
+    if distributed:
+        sampler = data.distributed.DistributedSampler(dataset, shuffle=shuffle, drop_last=True)
+        loader = data.DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
+                                 num_workers=args.num_workers, pin_memory=True)
+    else:
+        sampler = None
+        loader = data.DataLoader(dataset, batch_size=args.batch_size, shuffle=shuffle,
+                                 num_workers=args.num_workers, pin_memory=True)
+    return loader, sampler
+
+
+def fetch_next(loader_iter, loader):
+    """Get next batch; restart iterator on StopIteration."""
+    try:
+        return next(loader_iter), loader_iter
+    except StopIteration:
+        loader_iter = iter(loader)
+        return next(loader_iter), loader_iter
+
 def main():
     """Create the model and start the training."""
 
     args = get_arguments()
+    is_distributed = args.distributed
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+    if not is_distributed:
+        local_rank = args.gpu
+
+    if is_distributed:
+        dist.init_process_group(backend="nccl")
+
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     random.seed(args.random_seed)
     np.random.seed(args.random_seed)
     torch.manual_seed(args.random_seed)
-    torch.cuda.manual_seed_all(args.random_seed)
-    torch.cuda.manual_seed(args.random_seed)
+    if device.type == "cuda":
+        torch.cuda.set_device(local_rank)
+        torch.cuda.manual_seed_all(args.random_seed)
+        torch.cuda.manual_seed(args.random_seed)
+
+    is_main_process = (not is_distributed) or dist.get_rank() == 0
 
     now = datetime.now().strftime('%m-%d-%H-%M')
     run_name = f'{args.file_name}-{now}'
-
-    wandb.init(project='FIFO',name=f'{run_name}')
-    wandb.config.update(args)
+    if is_main_process:
+        wandb.init(project='FIFO', name=f'{run_name}')
+        wandb.config.update(args)
+    else:
+        wandb.init(mode='disabled')
 
     w, h = map(int, args.input_size.split(','))
     input_size = (w, h)
@@ -101,22 +147,22 @@ def main():
     input_size_rf = (w_r, h_r)   
 
     cudnn.enabled = True
-    gpu = args.gpu
+    gpu = local_rank
+    snapshot_dir = args.save_dir if args.save_dir else args.snapshot_dir
 
     if args.restore_from == RESTORE_FROM:
         start_iter = 0
         model = rf_lw101(num_classes=args.num_classes)
- 
     else:
-        restore = torch.load(args.restore_from)
+        restore = torch.load(args.restore_from, map_location='cpu')
         model = rf_lw101(num_classes=args.num_classes)
-
         model.load_state_dict(restore['state_dict'])
         start_iter = 0
 
-
+    model.to(device)
+    if is_distributed:
+        model = DDP(model, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
     model.train()
-    model.cuda(args.gpu)
 
     lr_fpf1 = 1e-3 
     lr_fpf2 = 1e-3
@@ -125,16 +171,20 @@ def main():
         lr_fpf1 = 5e-4
 
     FogPassFilter1 = FogPassFilter_conv1(2080)
-    FogPassFilter1_optimizer = torch.optim.Adamax([p for p in FogPassFilter1.parameters() if p.requires_grad == True], lr=lr_fpf1)
-    FogPassFilter1.cuda(args.gpu)
+    FogPassFilter1_optimizer = torch.optim.Adamax([p for p in FogPassFilter1.parameters() if p.requires_grad], lr=lr_fpf1)
+    FogPassFilter1.to(device)
     FogPassFilter2 = FogPassFilter_res1(32896)
-    FogPassFilter2_optimizer = torch.optim.Adamax([p for p in FogPassFilter2.parameters() if p.requires_grad == True], lr=lr_fpf2)
-    FogPassFilter2.cuda(args.gpu)
+    FogPassFilter2_optimizer = torch.optim.Adamax([p for p in FogPassFilter2.parameters() if p.requires_grad], lr=lr_fpf2)
+    FogPassFilter2.to(device)
 
     if args.restore_from_fogpass != RESTORE_FROM_fogpass:
-        restore = torch.load(args.restore_from_fogpass)
+        restore = torch.load(args.restore_from_fogpass, map_location='cpu')
         FogPassFilter1.load_state_dict(restore['fogpass1_state_dict'])
         FogPassFilter2.load_state_dict(restore['fogpass2_state_dict'])
+
+    if is_distributed:
+        FogPassFilter1 = DDP(FogPassFilter1, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
+        FogPassFilter2 = DDP(FogPassFilter2, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
 
     fogpassfilter_loss = losses.ContrastiveLoss(
         pos_margin=0.1,
@@ -145,42 +195,51 @@ def main():
 
     cudnn.benchmark = True
 
-    if not os.path.exists(args.snapshot_dir):
-        os.makedirs(args.snapshot_dir)
+    if is_main_process and not os.path.exists(snapshot_dir):
+        os.makedirs(snapshot_dir)
 
-    cwsf_pair_loader = data.DataLoader(Pairedcityscapes(args.data_dir, args.data_dir_cwsf, args.data_list, args.data_list_cwsf,
-                                        max_iters=args.num_steps * args.iter_size * args.batch_size,
-                                        mean=IMG_MEAN, set=args.set), batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-                                        pin_memory=True)
+    cwsf_dataset = Pairedcityscapes(args.data_dir, args.data_dir_cwsf, args.data_list, args.data_list_cwsf,
+                                    max_iters=args.num_steps * args.iter_size * args.batch_size,
+                                    mean=IMG_MEAN, set=args.set)
+    rf_dataset = foggyzurichDataSet(args.data_dir_rf, args.data_list_rf,
+                                    max_iters=args.num_steps * args.iter_size * args.batch_size,
+                                    mean=IMG_MEAN, set=args.set)
+    cwsf_fogpass_dataset = Pairedcityscapes(args.data_dir, args.data_dir_cwsf, args.data_list, args.data_list_cwsf,
+                                           max_iters=args.num_steps * args.iter_size * args.batch_size,
+                                           mean=IMG_MEAN, set=args.set)
+    rf_fogpass_dataset = foggyzurichDataSet(args.data_dir_rf, args.data_list_rf,
+                                           max_iters=args.num_steps * args.iter_size * args.batch_size,
+                                           mean=IMG_MEAN, set=args.set)
 
-    rf_loader = data.DataLoader(foggyzurichDataSet(args.data_dir_rf, args.data_list_rf,
-                                            max_iters=args.num_steps * args.iter_size * args.batch_size,
-                                            mean=IMG_MEAN, set=args.set),
-                                            batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-                                            pin_memory=True)
+    cwsf_pair_loader, cwsf_pair_sampler = build_loader(cwsf_dataset, args, is_distributed, shuffle=True)
+    rf_loader, rf_sampler = build_loader(rf_dataset, args, is_distributed, shuffle=True)
+    cwsf_pair_loader_fogpass, cwsf_pair_sampler_fogpass = build_loader(cwsf_fogpass_dataset, args, is_distributed, shuffle=True)
+    rf_loader_fogpass, rf_sampler_fogpass = build_loader(rf_fogpass_dataset, args, is_distributed, shuffle=True)
 
-    cwsf_pair_loader_fogpass = data.DataLoader(Pairedcityscapes(args.data_dir, args.data_dir_cwsf, args.data_list, args.data_list_cwsf,
-                                                max_iters=args.num_steps * args.iter_size * args.batch_size,
-                                                mean=IMG_MEAN, set=args.set), batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-                                                pin_memory=True)
-
-    rf_loader_fogpass = data.DataLoader(foggyzurichDataSet(args.data_dir_rf, args.data_list_rf,
-                                                    max_iters=args.num_steps * args.iter_size * args.batch_size,
-                                                    mean=IMG_MEAN, set=args.set), batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-                                                    pin_memory=True)
-
-    rf_loader_iter = enumerate(rf_loader)
-    cwsf_pair_loader_iter = enumerate(cwsf_pair_loader)
-    cwsf_pair_loader_iter_fogpass = enumerate(cwsf_pair_loader_fogpass)
-    rf_loader_iter_fogpass = enumerate(rf_loader_fogpass)
+    rf_loader_iter = iter(rf_loader)
+    cwsf_pair_loader_iter = iter(cwsf_pair_loader)
+    cwsf_pair_loader_iter_fogpass = iter(cwsf_pair_loader_fogpass)
+    rf_loader_iter_fogpass = iter(rf_loader_fogpass)
 
     optimisers, schedulers = setup_optimisers_and_schedulers(args, model=model)
     opts = make_list(optimisers)
     kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
     m = nn.Softmax(dim=1)
     log_m = nn.LogSoftmax(dim=1)    
+    scaler_seg = amp.GradScaler(enabled=bool(args.amp))
+    scaler_fpf = amp.GradScaler(enabled=bool(args.amp))
 
-    for i_iter in tqdm(range(start_iter, args.num_steps)): 
+    iter_source = tqdm(range(start_iter, args.num_steps)) if is_main_process else range(start_iter, args.num_steps)
+    for i_iter in iter_source: 
+        if is_distributed:
+            if cwsf_pair_sampler:
+                cwsf_pair_sampler.set_epoch(i_iter)
+            if rf_sampler:
+                rf_sampler.set_epoch(i_iter)
+            if cwsf_pair_sampler_fogpass:
+                cwsf_pair_sampler_fogpass.set_epoch(i_iter)
+            if rf_sampler_fogpass:
+                rf_sampler_fogpass.set_epoch(i_iter)
         loss_seg_cw_value = 0
         loss_seg_sf_value = 0
         loss_fsm_value = 0
@@ -201,20 +260,21 @@ def main():
             for param in FogPassFilter2.parameters():
                 param.requires_grad = True
   
-            _, batch = cwsf_pair_loader_iter_fogpass.__next__()
+            batch, cwsf_pair_loader_iter_fogpass = fetch_next(cwsf_pair_loader_iter_fogpass, cwsf_pair_loader_fogpass)
             sf_image, cw_image, label, size, sf_name, cw_name = batch
             interp = nn.Upsample(size=(size[0][0],size[0][1]), mode='bilinear')
             
-            _, batch_rf = rf_loader_iter_fogpass.__next__()
+            batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
             rf_img,rf_size, rf_name = batch_rf
-            img_rf = Variable(rf_img).cuda(args.gpu)
-            feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf) 
+            with amp.autocast(enabled=bool(args.amp)):
+                img_rf = Variable(rf_img).to(device)
+                feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf) 
 
-            images = Variable(sf_image).cuda(args.gpu)
-            feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images)
+                images = Variable(sf_image).to(device)
+                feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images)
 
-            images_cw = Variable(cw_image).cuda(args.gpu)
-            feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
+                images_cw = Variable(cw_image).to(device)
+                feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
 
             fsm_weights = {'layer0':0.5, 'layer1':0.5}
             sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}                
@@ -275,10 +335,11 @@ def main():
 
                 total_fpf_loss +=  fog_pass_filter_loss 
               
-                wandb.log({f'layer{idx}/fpf loss': fog_pass_filter_loss}, step=i_iter)
-                wandb.log({f'layer{idx}/total fpf loss': total_fpf_loss}, step=i_iter)
+                if is_main_process:
+                    wandb.log({f'layer{idx}/fpf loss': fog_pass_filter_loss}, step=i_iter)
+                    wandb.log({f'layer{idx}/total fpf loss': total_fpf_loss}, step=i_iter)
 
-            total_fpf_loss.backward(retain_graph=False)
+            scaler_fpf.scale(total_fpf_loss).backward(retain_graph=False)
 
 
             if args.modeltrain=='train':
@@ -293,58 +354,61 @@ def main():
                 for param in FogPassFilter2.parameters():
                     param.requires_grad = False
 
-                _, batch = cwsf_pair_loader_iter.__next__()
+                batch, cwsf_pair_loader_iter = fetch_next(cwsf_pair_loader_iter, cwsf_pair_loader)
                 sf_image, cw_image, label, size, sf_name, cw_name = batch
 
                 interp = nn.Upsample(size=(size[0][0],size[0][1]), mode='bilinear')
 
                 if i_iter % 3 == 0:
-                    images_sf = Variable(sf_image).cuda(args.gpu)
-                    feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images_sf)
-                    pred_sf5 = interp(feature_sf5)
-                    loss_seg_sf = loss_calc(pred_sf5, label, args.gpu)
-                    images_cw = Variable(cw_image).cuda(args.gpu)
-                    feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
-                    pred_cw5 = interp(feature_cw5)
-                    feature_cw5_logsoftmax = log_m(feature_cw5)
-                    feature_sf5_softmax = m(feature_sf5)
-                    feature_sf5_logsoftmax = log_m(feature_sf5)
-                    feature_cw5_softmax = m(feature_cw5)
-                    loss_con = kl_loss(feature_sf5_logsoftmax, feature_cw5_softmax)
-                    loss_seg_cw = loss_calc(pred_cw5, label, args.gpu)     
-                    fsm_weights = {'layer0':0.5, 'layer1':0.5}
-                    sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}                
-                    cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
+                    with amp.autocast(enabled=bool(args.amp)):
+                        images_sf = Variable(sf_image).to(device)
+                        feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images_sf)
+                        pred_sf5 = interp(feature_sf5)
+                        loss_seg_sf = loss_calc(pred_sf5, label, device)
+                        images_cw = Variable(cw_image).to(device)
+                        feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
+                        pred_cw5 = interp(feature_cw5)
+                        feature_cw5_logsoftmax = log_m(feature_cw5)
+                        feature_sf5_softmax = m(feature_sf5)
+                        feature_sf5_logsoftmax = log_m(feature_sf5)
+                        feature_cw5_softmax = m(feature_cw5)
+                        loss_con = kl_loss(feature_sf5_logsoftmax, feature_cw5_softmax)
+                        loss_seg_cw = loss_calc(pred_cw5, label, device)     
+                        fsm_weights = {'layer0':0.5, 'layer1':0.5}
+                        sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}                
+                        cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
 
                 if i_iter % 3 == 1:
-                    _, batch_rf = rf_loader_iter.__next__()
+                    batch_rf, rf_loader_iter = fetch_next(rf_loader_iter, rf_loader)
                     rf_img,rf_size, rf_name = batch_rf
-                    images_sf = Variable(sf_image).cuda(args.gpu)
-                    feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images_sf)
-                    pred_sf5 = interp(feature_sf5)
-                    loss_seg_sf = loss_calc(pred_sf5, label, args.gpu)       
-                    loss_seg_cw = 0   
-                    loss_con = 0
-                    img_rf = Variable(rf_img).cuda(args.gpu)
-                    feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf)    
-                    rf_features = {'layer0':feature_rf0, 'layer1':feature_rf1}
-                    sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}
-                    fsm_weights = {'layer0':0.5, 'layer1':0.5}
+                    with amp.autocast(enabled=bool(args.amp)):
+                        images_sf = Variable(sf_image).to(device)
+                        feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images_sf)
+                        pred_sf5 = interp(feature_sf5)
+                        loss_seg_sf = loss_calc(pred_sf5, label, device)       
+                        loss_seg_cw = 0   
+                        loss_con = 0
+                        img_rf = Variable(rf_img).to(device)
+                        feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf)    
+                        rf_features = {'layer0':feature_rf0, 'layer1':feature_rf1}
+                        sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}
+                        fsm_weights = {'layer0':0.5, 'layer1':0.5}
                 
                 if i_iter % 3 == 2:
-                    _, batch_rf = rf_loader_iter.__next__()
+                    batch_rf, rf_loader_iter = fetch_next(rf_loader_iter, rf_loader)
                     rf_img,rf_size, rf_name = batch_rf
-                    images_cw = Variable(cw_image).cuda(args.gpu)
-                    feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
-                    pred_cw5 = interp(feature_cw5)
-                    loss_seg_sf = 0
-                    loss_con = 0
-                    loss_seg_cw = loss_calc(pred_cw5, label, args.gpu)      
-                    img_rf = Variable(rf_img).cuda(args.gpu)
-                    feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf)                  
-                    rf_features = {'layer0':feature_rf0, 'layer1':feature_rf1}
-                    cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
-                    fsm_weights = {'layer0':0.5, 'layer1':0.5}
+                    with amp.autocast(enabled=bool(args.amp)):
+                        images_cw = Variable(cw_image).to(device)
+                        feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
+                        pred_cw5 = interp(feature_cw5)
+                        loss_seg_sf = 0
+                        loss_con = 0
+                        loss_seg_cw = loss_calc(pred_cw5, label, device)      
+                        img_rf = Variable(rf_img).to(device)
+                        feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf)                  
+                        rf_features = {'layer0':feature_rf0, 'layer1':feature_rf1}
+                        cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
+                        fsm_weights = {'layer0':0.5, 'layer1':0.5}
 
                 loss_fsm = 0
                 fog_pass_filter_loss = 0
@@ -395,7 +459,7 @@ def main():
 
                 loss = loss_seg_sf + loss_seg_cw + args.lambda_fsm*loss_fsm + args.lambda_con*loss_con  
                 loss = loss / args.iter_size
-                loss.backward()
+                scaler_seg.scale(loss).backward()
 
                 if loss_seg_cw != 0:
                     loss_seg_cw_value += loss_seg_cw.data.cpu().numpy() / args.iter_size
@@ -407,17 +471,20 @@ def main():
                     loss_con_value += loss_con.data.cpu().numpy() / args.iter_size
 
             
-                wandb.log({"fsm loss": args.lambda_fsm*loss_fsm_value}, step=i_iter)
-                wandb.log({'SF_loss_seg': loss_seg_sf_value}, step=i_iter)
-                wandb.log({'CW_loss_seg': loss_seg_cw_value}, step=i_iter)
-                wandb.log({'consistency loss':args.lambda_con*loss_con_value}, step=i_iter)
-                wandb.log({'total_loss': loss}, step=i_iter)           
+                if is_main_process:
+                    wandb.log({"fsm loss": args.lambda_fsm*loss_fsm_value}, step=i_iter)
+                    wandb.log({'SF_loss_seg': loss_seg_sf_value}, step=i_iter)
+                    wandb.log({'CW_loss_seg': loss_seg_cw_value}, step=i_iter)
+                    wandb.log({'consistency loss':args.lambda_con*loss_con_value}, step=i_iter)
+                    wandb.log({'total_loss': loss}, step=i_iter)           
 
                 for opt in opts:
-                    opt.step()
+                    scaler_seg.step(opt)
+                scaler_seg.update()
 
-            FogPassFilter1_optimizer.step()
-            FogPassFilter2_optimizer.step()
+            scaler_fpf.step(FogPassFilter1_optimizer)
+            scaler_fpf.step(FogPassFilter2_optimizer)
+            scaler_fpf.update()
 
         if i_iter < 20000:
             save_pred_every = 5000
@@ -427,19 +494,20 @@ def main():
             save_pred_every = args.save_pred_every
 
         if i_iter >= args.num_steps_stop - 1:
-            print('save model ..')
-            torch.save(model.state_dict(), osp.join(args.snapshot_dir, args.file_name + str(args.num_steps_stop) + '.pth'))
+            if is_main_process:
+                print('save model ..')
+                torch.save(get_state_dict(model), osp.join(snapshot_dir, args.file_name + str(args.num_steps_stop) + '.pth'))
             break
-        if args.modeltrain != 'train':
+        if is_main_process and args.modeltrain != 'train':
             if i_iter == 5000:
-                torch.save({'state_dict':model.state_dict(),
-                'fogpass1_state_dict':FogPassFilter1.state_dict(),
-                'fogpass2_state_dict':FogPassFilter2.state_dict(),
+                torch.save({'state_dict':get_state_dict(model),
+                'fogpass1_state_dict':get_state_dict(FogPassFilter1),
+                'fogpass2_state_dict':get_state_dict(FogPassFilter2),
                 'train_iter':i_iter,
                 'args':args
-                },osp.join(args.snapshot_dir, run_name)+'_fogpassfilter_'+str(i_iter)+'.pth')
+                },osp.join(snapshot_dir, run_name)+'_fogpassfilter_'+str(i_iter)+'.pth')
 
-        if i_iter % save_pred_every == 0 and i_iter != 0:
+        if is_main_process and i_iter % save_pred_every == 0 and i_iter != 0:
             print('taking snapshot ...')
             save_dir = osp.join(f'./result/FIFO_model', args.file_name)
             
@@ -447,12 +515,12 @@ def main():
                 os.makedirs(save_dir)
             
             torch.save({
-                'state_dict':model.state_dict(),
-                'fogpass1_state_dict':FogPassFilter1.state_dict(),
-                'fogpass2_state_dict':FogPassFilter2.state_dict(),
+                'state_dict':get_state_dict(model),
+                'fogpass1_state_dict':get_state_dict(FogPassFilter1),
+                'fogpass2_state_dict':get_state_dict(FogPassFilter2),
                 'train_iter':i_iter,
                 'args':args
-            },osp.join(args.snapshot_dir, run_name)+'_FIFO'+str(i_iter)+'.pth')
+            },osp.join(snapshot_dir, run_name)+'_FIFO'+str(i_iter)+'.pth')
             
 if __name__ == '__main__':
     main()
