@@ -87,6 +87,18 @@ def get_state_dict(module):
     return module.module.state_dict() if isinstance(module, DDP) else module.state_dict()
 
 
+def load_checkpoint(path):
+    """Load checkpoint tolerant to different formats; returns (state_dict, start_iter)."""
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    if isinstance(ckpt, dict):
+        state = ckpt.get('state_dict', ckpt)
+        start_iter = ckpt.get('train_iter', 0)
+    else:
+        state = ckpt
+        start_iter = 0
+    return state, start_iter
+
+
 def build_loader(dataset, args, distributed, shuffle=True):
     """Create DataLoader with optional DistributedSampler."""
     if distributed:
@@ -112,7 +124,8 @@ def main():
     """Create the model and start the training."""
 
     args = get_arguments()
-    is_distributed = args.distributed
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_distributed = args.distributed or env_world_size > 1
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
     if not is_distributed:
         local_rank = args.gpu
@@ -156,10 +169,9 @@ def main():
         start_iter = 0
         model = rf_lw101(num_classes=args.num_classes)
     else:
-        restore = torch.load(args.restore_from, map_location='cpu', weights_only=False)
+        state_dict, start_iter = load_checkpoint(args.restore_from)
         model = rf_lw101(num_classes=args.num_classes)
-        model.load_state_dict(restore['state_dict'])
-        start_iter = 0
+        model.load_state_dict(state_dict, strict=False)
 
     model.to(device)
     if is_distributed:
@@ -180,9 +192,13 @@ def main():
     FogPassFilter2.to(device)
 
     if args.restore_from_fogpass != RESTORE_FROM_fogpass:
-        restore = torch.load(args.restore_from_fogpass, map_location='cpu', weights_only=False)
-        FogPassFilter1.load_state_dict(restore['fogpass1_state_dict'])
-        FogPassFilter2.load_state_dict(restore['fogpass2_state_dict'])
+        fog_ckpt, _ = load_checkpoint(args.restore_from_fogpass)
+        # fog_ckpt may be a full checkpoint dict or plain state dicts
+        if 'fogpass1_state_dict' in fog_ckpt:
+            FogPassFilter1.load_state_dict(fog_ckpt['fogpass1_state_dict'])
+            FogPassFilter2.load_state_dict(fog_ckpt['fogpass2_state_dict'])
+        else:
+            FogPassFilter1.load_state_dict(fog_ckpt)
 
     if is_distributed:
         FogPassFilter1 = DDP(FogPassFilter1, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
@@ -268,7 +284,7 @@ def main():
             
             batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
             rf_img,rf_size, rf_name = batch_rf
-            with amp.autocast(enabled=bool(args.amp)):
+            with torch.amp.autocast('cuda', enabled=bool(args.amp)):
                 img_rf = Variable(rf_img).to(device)
                 feature_rf0, feature_rf1, feature_rf2, feature_rf3, feature_rf4, feature_rf5 = model(img_rf) 
 
@@ -362,7 +378,7 @@ def main():
                 interp = nn.Upsample(size=(size[0][0],size[0][1]), mode='bilinear')
 
                 if i_iter % 3 == 0:
-                    with amp.autocast(enabled=bool(args.amp)):
+                    with torch.amp.autocast('cuda', enabled=bool(args.amp)):
                         images_sf = Variable(sf_image).to(device)
                         feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images_sf)
                         pred_sf5 = interp(feature_sf5)
@@ -383,7 +399,7 @@ def main():
                 if i_iter % 3 == 1:
                     batch_rf, rf_loader_iter = fetch_next(rf_loader_iter, rf_loader)
                     rf_img,rf_size, rf_name = batch_rf
-                    with amp.autocast(enabled=bool(args.amp)):
+                    with torch.amp.autocast('cuda', enabled=bool(args.amp)):
                         images_sf = Variable(sf_image).to(device)
                         feature_sf0,feature_sf1,feature_sf2, feature_sf3,feature_sf4,feature_sf5 = model(images_sf)
                         pred_sf5 = interp(feature_sf5)
@@ -399,7 +415,7 @@ def main():
                 if i_iter % 3 == 2:
                     batch_rf, rf_loader_iter = fetch_next(rf_loader_iter, rf_loader)
                     rf_img,rf_size, rf_name = batch_rf
-                    with amp.autocast(enabled=bool(args.amp)):
+                    with torch.amp.autocast('cuda', enabled=bool(args.amp)):
                         images_cw = Variable(cw_image).to(device)
                         feature_cw0, feature_cw1, feature_cw2, feature_cw3, feature_cw4, feature_cw5 = model(images_cw)
                         pred_cw5 = interp(feature_cw5)
