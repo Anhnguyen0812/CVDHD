@@ -154,7 +154,7 @@ def main():
         start_iter = 0
         model = rf_lw101(num_classes=args.num_classes)
     else:
-        restore = torch.load(args.restore_from, map_location='cpu')
+        restore = torch.load(args.restore_from, map_location='cpu', weights_only=False)
         model = rf_lw101(num_classes=args.num_classes)
         model.load_state_dict(restore['state_dict'])
         start_iter = 0
@@ -178,7 +178,7 @@ def main():
     FogPassFilter2.to(device)
 
     if args.restore_from_fogpass != RESTORE_FROM_fogpass:
-        restore = torch.load(args.restore_from_fogpass, map_location='cpu')
+        restore = torch.load(args.restore_from_fogpass, map_location='cpu', weights_only=False)
         FogPassFilter1.load_state_dict(restore['fogpass1_state_dict'])
         FogPassFilter2.load_state_dict(restore['fogpass2_state_dict'])
 
