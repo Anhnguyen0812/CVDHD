@@ -244,8 +244,8 @@ def main():
     kl_loss = torch.nn.KLDivLoss(reduction='batchmean')
     m = nn.Softmax(dim=1)
     log_m = nn.LogSoftmax(dim=1)    
-    scaler_seg = amp.GradScaler(enabled=bool(args.amp))
-    scaler_fpf = amp.GradScaler(enabled=bool(args.amp))
+    scaler_seg = torch.amp.GradScaler('cuda', enabled=bool(args.amp))
+    scaler_fpf = torch.amp.GradScaler('cuda', enabled=bool(args.amp))
 
     iter_source = tqdm(range(start_iter, args.num_steps)) if is_main_process else range(start_iter, args.num_steps)
     for i_iter in iter_source: 
