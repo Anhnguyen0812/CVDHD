@@ -7,18 +7,17 @@ BATCH_SIZE = 4
 ITER_SIZE = 1
 NUM_WORKERS = 4
 DATA_DIRECTORY ='/kaggle/input/fifo-dataset'
-DATA_LIST_PATH = f'/kaggle/working/CVDHD/dataset/cityscapes_list/train_foggy_{BETA}.txt'
-DATA_CITY_PATH = '/kaggle/working/CVDHD/dataset/cityscapes_list/clear_lindau.txt'
+DATA_LIST_PATH = f'/kaggle/working/FIFO_impr/dataset/cityscapes_list/train_foggy_{BETA}.txt'
+DATA_CITY_PATH = '/kaggle/working/FIFO_impr/dataset/cityscapes_list/clear_lindau.txt'
 INPUT_SIZE = '2048,1024'
 DATA_DIRECTORY_CWSF = '/kaggle/input/fifo-dataset'
-DATA_LIST_PATH_CWSF = '/kaggle/working/CVDHD/dataset/cityscapes_list/train_origin.txt'
+DATA_LIST_PATH_CWSF = '/kaggle/working/FIFO_impr/dataset/cityscapes_list/train_origin.txt'
 DATA_LIST_RF = '/kaggle/input/fifo-dataset/foggy_zurich/Foggy_Zurich/lists_file_names/RGB_light_filenames.txt'
 DATA_DIR = '/kaggle/input/fifo-dataset'
 INPUT_SIZE_RF = '1920,1080'
 NUM_CLASSES = 19 
 NUM_STEPS = 100000 
 NUM_STEPS_STOP = 60000  # early stopping
-RESUME_STEPS = 5000
 RANDOM_SEED = 1234
 RESTORE_FROM = 'no_model'
 RESTORE_FROM_fogpass = 'no_model'
@@ -47,8 +46,6 @@ def get_arguments():
     parser.add_argument("--num-classes", type=int, default=NUM_CLASSES)
     parser.add_argument("--num-steps", type=int, default=NUM_STEPS)
     parser.add_argument("--num-steps-stop", type=int, default=NUM_STEPS_STOP)
-    parser.add_argument("--resume-steps", type=int, default=RESUME_STEPS,
-                        help="If resuming past num_steps, run this many additional steps")
     parser.add_argument("--random-seed", type=int, default=RANDOM_SEED)
     parser.add_argument("--restore-from", type=str, default=RESTORE_FROM)
     parser.add_argument("--restore-from-fogpass", type=str, default=RESTORE_FROM_fogpass)
