@@ -435,7 +435,8 @@ def main():
 
                     fogpassfilter.eval()
 
-                    for batch_idx in range(4):
+                    actual_batch_fsm = b_feature.size(0)
+                    for batch_idx in range(actual_batch_fsm):
                         b_gram = gram_matrix(b_feature[batch_idx])
                         a_gram = gram_matrix(a_feature[batch_idx])
 
@@ -451,7 +452,7 @@ def main():
                         
                         layer_fsm_loss += fsm_weights[layer]*torch.mean((fog_factor_b/(hb*wb) - fog_factor_a/(ha*wa))**2)/half/ b_feature.size(0)
 
-                    loss_fsm += layer_fsm_loss / 4.
+                    loss_fsm += layer_fsm_loss / float(actual_batch_fsm)
 
                 loss = loss_seg_sf + loss_seg_cw + args.lambda_fsm*loss_fsm + args.lambda_con*loss_con  
                 loss = loss / args.iter_size
