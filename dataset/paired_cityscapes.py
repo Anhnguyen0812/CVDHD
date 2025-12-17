@@ -95,9 +95,9 @@ class Pairedcityscapes(data.Dataset):
         self.ignore_index = 255
         self.class_map = dict(zip(self.valid_classes, range(19)))
         for name in self.img_ids:
-            trg_img_file = osp.join(self.trg_root, "leftImg8bit/%s/%s" % (self.set, name[:-21]+'.png'))
-            src_img_file = osp.join(self.src_root, "./leftImg8bit_foggyDBF/%s/%s" % (self.set, name))
-            label_file = osp.join(self.src_root, "./Cityscapes/gtFine/%s/%s" % (self.set, name[:-32]+'gtFine_labelIds.png'))
+            trg_img_file = osp.join(self.trg_root, "leftImg8bit/leftImg8bit/%s/%s" % (self.set, name[:-21]+'.png'))
+            src_img_file = osp.join(self.src_root, "foggy/leftImg8bit_foggy/%s/%s" % (self.set, name))
+            label_file = osp.join(self.src_root, "gtFine/gtFine/%s/%s" % (self.set, name[:-32]+'gtFine_labelIds.png'))
             self.files.append({
                 "src_img": src_img_file,
                 "trg_img": trg_img_file,
