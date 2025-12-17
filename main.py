@@ -173,6 +173,12 @@ def main():
         model = rf_lw101(num_classes=args.num_classes)
         model.load_state_dict(state_dict, strict=False)
 
+    # Ensure we actually run when resuming from a later stage
+    if start_iter >= args.num_steps:
+        args.num_steps = start_iter + 1
+    if start_iter >= args.num_steps_stop:
+        args.num_steps_stop = start_iter + 1
+
     model.to(device)
     if is_distributed:
         model = DDP(model, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
