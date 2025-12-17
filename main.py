@@ -339,6 +339,12 @@ def main():
 
             scaler_fpf.scale(total_fpf_loss).backward(retain_graph=False)
 
+            # Complete fogpass optimizer step BEFORE segmentation phase to avoid inplace op conflicts
+            scaler_fpf.step(FogPassFilter1_optimizer)
+            scaler_fpf.step(FogPassFilter2_optimizer)
+            scaler_fpf.update()
+            FogPassFilter1_optimizer.zero_grad()
+            FogPassFilter2_optimizer.zero_grad()
 
             if args.modeltrain=='train':
                 # train segmentation network
@@ -480,10 +486,6 @@ def main():
                 for opt in opts:
                     scaler_seg.step(opt)
                 scaler_seg.update()
-
-            scaler_fpf.step(FogPassFilter1_optimizer)
-            scaler_fpf.step(FogPassFilter2_optimizer)
-            scaler_fpf.update()
 
         if i_iter < 20000:
             save_pred_every = 5000
