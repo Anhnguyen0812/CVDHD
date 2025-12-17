@@ -112,8 +112,11 @@ def main():
     """Create the model and start the training."""
 
     args = get_arguments()
-    is_distributed = args.distributed
+    # Auto-detect distributed mode from torchrun env vars
     local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_distributed = args.distributed or world_size > 1
+    
     if not is_distributed:
         local_rank = args.gpu
 
