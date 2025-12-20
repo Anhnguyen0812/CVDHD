@@ -549,43 +549,10 @@ def main():
                         sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}
                         fsm_weights = {'layer0':0.5, 'layer1':0.5}
 
-                    # Contrastive loss between SF and RF
-                    base_cl_lambda = float(getattr(args, "lambda_cl", 0.0))
-                    warmup_steps = int(getattr(args, "cl_warmup_steps", 0))
-                    if warmup_steps > 0:
-                        cl_lambda = base_cl_lambda * min(1.0, float(i_iter) / float(warmup_steps))
-                    else:
-                        cl_lambda = base_cl_lambda
-
-                    if cl_lambda > 0:
-                        emb_a = _global_pool_embedding(feature_sf4)
-                        emb_b = _global_pool_embedding(feature_rf4)
-
-                        if proj_head is None:
-                            proj_head = _ProjHead(emb_a.size(1)).to(device)
-                            if proj_head_ckpt is not None:
-                                try:
-                                    proj_head.load_state_dict(_strip_module_prefix(proj_head_ckpt), strict=False)
-                                except Exception as e:
-                                    if is_main_process:
-                                        print(f"[ProjHead] Could not load state_dict: {e}")
-                            if is_distributed:
-                                proj_head = DDP(proj_head, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
-                            proj_head_opt = torch.optim.AdamW(
-                                [p for p in proj_head.parameters() if p.requires_grad],
-                                lr=float(getattr(args, "cl_head_lr", 1e-3)),
-                                weight_decay=1e-4,
-                            )
-
-                        proj_head.train()
-                        z_a = F.normalize(proj_head(emb_a), p=2, dim=1, eps=1e-6)
-                        z_b = F.normalize(proj_head(emb_b), p=2, dim=1, eps=1e-6)
-                        n = z_a.size(0)
-                        emb = torch.cat([z_a, z_b], dim=0)
-                        cl_labels = torch.arange(n, device=device, dtype=torch.long).repeat(2)
-                        loss_cl = contrastive_loss_fn(emb, cl_labels)
-                    else:
-                        loss_cl = 0
+                    # IMPORTANT: RF (Foggy Zurich) samples are unpaired with Cityscapes.
+                    # Do NOT apply supervised/paired contrastive positives between SF and RF by index.
+                    cl_lambda = 0.0
+                    loss_cl = 0
                 
                 if i_iter % 3 == 2:
                     batch_rf, rf_loader_iter = fetch_next(rf_loader_iter, rf_loader)
@@ -603,43 +570,9 @@ def main():
                         cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
                         fsm_weights = {'layer0':0.5, 'layer1':0.5}
 
-                    # Contrastive loss between CW and RF
-                    base_cl_lambda = float(getattr(args, "lambda_cl", 0.0))
-                    warmup_steps = int(getattr(args, "cl_warmup_steps", 0))
-                    if warmup_steps > 0:
-                        cl_lambda = base_cl_lambda * min(1.0, float(i_iter) / float(warmup_steps))
-                    else:
-                        cl_lambda = base_cl_lambda
-
-                    if cl_lambda > 0:
-                        emb_a = _global_pool_embedding(feature_cw4)
-                        emb_b = _global_pool_embedding(feature_rf4)
-
-                        if proj_head is None:
-                            proj_head = _ProjHead(emb_a.size(1)).to(device)
-                            if proj_head_ckpt is not None:
-                                try:
-                                    proj_head.load_state_dict(_strip_module_prefix(proj_head_ckpt), strict=False)
-                                except Exception as e:
-                                    if is_main_process:
-                                        print(f"[ProjHead] Could not load state_dict: {e}")
-                            if is_distributed:
-                                proj_head = DDP(proj_head, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
-                            proj_head_opt = torch.optim.AdamW(
-                                [p for p in proj_head.parameters() if p.requires_grad],
-                                lr=float(getattr(args, "cl_head_lr", 1e-3)),
-                                weight_decay=1e-4,
-                            )
-
-                        proj_head.train()
-                        z_a = F.normalize(proj_head(emb_a), p=2, dim=1, eps=1e-6)
-                        z_b = F.normalize(proj_head(emb_b), p=2, dim=1, eps=1e-6)
-                        n = z_a.size(0)
-                        emb = torch.cat([z_a, z_b], dim=0)
-                        cl_labels = torch.arange(n, device=device, dtype=torch.long).repeat(2)
-                        loss_cl = contrastive_loss_fn(emb, cl_labels)
-                    else:
-                        loss_cl = 0
+                    # IMPORTANT: RF samples are unpaired; disable paired contrastive here as well.
+                    cl_lambda = 0.0
+                    loss_cl = 0
 
                 loss_fsm = 0
                 fog_pass_filter_loss = 0

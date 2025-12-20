@@ -227,6 +227,20 @@ def eval():
 
     # Test on Clear Lindau (if available)
     try:
+        # Quick diagnostics: check that the first image/label exists under provided roots.
+        try:
+            with open(args.data_city_list, "r") as f:
+                first_rel = f.readline().strip()
+            if first_rel:
+                expected_img = osp.join(args.data_dir_city, f"leftImg8bit/{args.set}/{first_rel}")
+                if not osp.exists(expected_img):
+                    raise FileNotFoundError(f"Missing Cityscapes image: {expected_img}")
+        except FileNotFoundError:
+            raise
+        except Exception as e:
+            # Non-fatal; continue and let DataLoader raise if needed
+            print(f"[Lindau] Pre-check skipped: {e}")
+
         testloader1 = data.DataLoader(cityscapesDataSet(args.data_dir_city, args.data_city_list, crop_size = (2048, 1024), mean=IMG_MEAN, scale=False, mirror=False, set=args.set),
                                 batch_size=1, shuffle=False, pin_memory=True)
         testloader2 = data.DataLoader(cityscapesDataSet(args.data_dir_city, args.data_city_list, crop_size = (2048*0.8, 1024*0.8), mean=IMG_MEAN, scale=False, mirror=False, set=args.set),
@@ -269,8 +283,8 @@ def eval():
             output_col.save('%s/%s_color.png' % (save_dir_clindau, name.split('.')[0]))
 
         miou_clindau = compute_mIoU(args.gt_dir_clindau, save_dir_clindau, args.devkit_dir_clindau, 'Clindau')
-    except FileNotFoundError:
-        print("Skipping Clear Lindau evaluation (dataset not available)")
+    except FileNotFoundError as e:
+        print(f"Skipping Clear Lindau evaluation (dataset not available): {e}")
         miou_clindau = 0
 
 
