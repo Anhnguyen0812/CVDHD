@@ -154,6 +154,11 @@ def fetch_next(loader_iter, loader):
         return next(loader_iter), loader_iter
 
 
+def _set_batchnorm_eval(m: nn.Module):
+    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+        m.eval()
+
+
 def label_to_edges(label: torch.Tensor, ignore_index: int = 255) -> torch.Tensor:
     """Convert label map (N,H,W) to binary boundary map (N,1,H,W)."""
     if label.dim() != 3:
@@ -250,6 +255,10 @@ def main():
         student = DDP(student, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     student.train()
 
+    freeze_bn = bool(getattr(args, "freeze_bn", False)) or bool(getattr(args, "finetune", False))
+    if freeze_bn:
+        student.apply(_set_batchnorm_eval)
+
     # Teacher model (fixed) for pseudo labels
     teacher = rf_lw101(num_classes=args.num_classes)
     if args.restore_from != RESTORE_FROM:
@@ -270,6 +279,14 @@ def main():
     # FogPass
     lr_fpf1 = 5e-4 if args.modeltrain == "train" else 1e-3
     lr_fpf2 = 1e-3
+
+    if getattr(args, "fpf1_lr", None) is not None:
+        lr_fpf1 = float(args.fpf1_lr)
+    if getattr(args, "fpf2_lr", None) is not None:
+        lr_fpf2 = float(args.fpf2_lr)
+    lr_fpf_mult = float(getattr(args, "fpf_lr_mult", 1.0))
+    lr_fpf1 *= lr_fpf_mult
+    lr_fpf2 *= lr_fpf_mult
     FogPassFilter1 = FogPassFilter_conv1(2080).to(device)
     FogPassFilter2 = FogPassFilter_res1(32896).to(device)
     FogPassFilter1_optimizer = torch.optim.Adamax([p for p in FogPassFilter1.parameters() if p.requires_grad], lr=lr_fpf1)
@@ -325,6 +342,7 @@ def main():
     scaler_bnd = amp.GradScaler(enabled=bool(args.amp))
 
     iter_source = tqdm(range(0, args.num_steps)) if is_main_process else range(0, args.num_steps)
+    freeze_fogpass_steps = int(getattr(args, "freeze_fogpass_steps", 0))
     for i_iter in iter_source:
         if is_distributed:
             if cwsf_pair_sampler:
@@ -343,38 +361,39 @@ def main():
 
         for _sub_i in range(args.iter_size):
             # ===== Phase A: train fog-pass filtering modules (same as FIFO) =====
-            student.eval()
-            for p in student.parameters():
-                p.requires_grad = False
-            for p in FogPassFilter1.parameters():
-                p.requires_grad = True
-            for p in FogPassFilter2.parameters():
-                p.requires_grad = True
+            if i_iter >= freeze_fogpass_steps:
+                student.eval()
+                for p in student.parameters():
+                    p.requires_grad = False
+                for p in FogPassFilter1.parameters():
+                    p.requires_grad = True
+                for p in FogPassFilter2.parameters():
+                    p.requires_grad = True
 
-            batch, cwsf_pair_loader_iter_fogpass = fetch_next(cwsf_pair_loader_iter_fogpass, cwsf_pair_loader_fogpass)
-            sf_image, cw_image, label, size, _sf_name, _cw_name = batch
+                batch, cwsf_pair_loader_iter_fogpass = fetch_next(cwsf_pair_loader_iter_fogpass, cwsf_pair_loader_fogpass)
+                sf_image, cw_image, label, size, _sf_name, _cw_name = batch
 
-            batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
-            rf_img, _rf_size, _rf_name = batch_rf
+                batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
+                rf_img, _rf_size, _rf_name = batch_rf
 
-            with torch.no_grad():
-                with amp.autocast(enabled=bool(args.amp)):
-                    img_rf = rf_img.to(device)
-                    feature_rf0, feature_rf1, *_rest = student(img_rf)
+                with torch.no_grad():
+                    with amp.autocast(enabled=bool(args.amp)):
+                        img_rf = rf_img.to(device)
+                        feature_rf0, feature_rf1, *_rest = student(img_rf)
 
-                    images_sf = sf_image.to(device)
-                    feature_sf0, feature_sf1, *_rest2 = student(images_sf)
+                        images_sf = sf_image.to(device)
+                        feature_sf0, feature_sf1, *_rest2 = student(images_sf)
 
-                    images_cw = cw_image.to(device)
-                    feature_cw0, feature_cw1, *_rest3 = student(images_cw)
+                        images_cw = cw_image.to(device)
+                        feature_cw0, feature_cw1, *_rest3 = student(images_cw)
 
-            fsm_weights = {"layer0": 0.5, "layer1": 0.5}
-            sf_features = {"layer0": feature_sf0.detach(), "layer1": feature_sf1.detach()}
-            cw_features = {"layer0": feature_cw0.detach(), "layer1": feature_cw1.detach()}
-            rf_features = {"layer0": feature_rf0.detach(), "layer1": feature_rf1.detach()}
+                fsm_weights = {"layer0": 0.5, "layer1": 0.5}
+                sf_features = {"layer0": feature_sf0.detach(), "layer1": feature_sf1.detach()}
+                cw_features = {"layer0": feature_cw0.detach(), "layer1": feature_cw1.detach()}
+                rf_features = {"layer0": feature_rf0.detach(), "layer1": feature_rf1.detach()}
 
-            total_fpf_loss = 0
-            for idx, layer in enumerate(fsm_weights):
+                total_fpf_loss = 0
+                for idx, layer in enumerate(fsm_weights):
                 cw_feature = cw_features[layer]
                 sf_feature = sf_features[layer]
                 rf_feature = rf_features[layer]
@@ -413,12 +432,15 @@ def main():
                     wandb.log({f"layer{idx}/fpf loss": fog_pass_filter_loss}, step=i_iter)
                     wandb.log({f"layer{idx}/total fpf loss": total_fpf_loss}, step=i_iter)
 
-            scaler_fpf.scale(total_fpf_loss).backward()
-            scaler_fpf.step(FogPassFilter1_optimizer)
-            scaler_fpf.step(FogPassFilter2_optimizer)
-            scaler_fpf.update()
-            FogPassFilter1_optimizer.zero_grad(set_to_none=True)
-            FogPassFilter2_optimizer.zero_grad(set_to_none=True)
+                scaler_fpf.scale(total_fpf_loss).backward()
+                scaler_fpf.step(FogPassFilter1_optimizer)
+                scaler_fpf.step(FogPassFilter2_optimizer)
+                scaler_fpf.update()
+                FogPassFilter1_optimizer.zero_grad(set_to_none=True)
+                FogPassFilter2_optimizer.zero_grad(set_to_none=True)
+            else:
+                if is_main_process and i_iter == 0 and freeze_fogpass_steps > 0:
+                    print(f"[Freeze] FogPassFilter updates frozen for first {freeze_fogpass_steps} steps")
 
             # ===== Phase B: boundary head warm-up / finetune =====
             if args.modeltrain == "train":
@@ -444,6 +466,8 @@ def main():
                         p.requires_grad = False
                 else:
                     student.train()
+                    if freeze_bn:
+                        student.apply(_set_batchnorm_eval)
                     for p in student.parameters():
                         p.requires_grad = True
                     for p in FogPassFilter1.parameters():
@@ -578,10 +602,15 @@ def main():
                     wandb.log({"total_loss": float(total_loss.detach().cpu())}, step=i_iter)
 
         # snapshots
-        if i_iter < 20000:
-            save_pred_every = 2000 if args.modeltrain == "train" else 5000
+        early_every = int(getattr(args, "save_pred_every_early", 0))
+        early_until = int(getattr(args, "save_pred_early_until", 0))
+        if early_every > 0 and early_until > 0 and i_iter < early_until:
+            save_pred_every = early_every
         else:
-            save_pred_every = args.save_pred_every
+            if i_iter < 20000:
+                save_pred_every = 2000 if args.modeltrain == "train" else 5000
+            else:
+                save_pred_every = args.save_pred_every
 
         if i_iter >= args.num_steps_stop - 1:
             if is_main_process:

@@ -154,6 +154,11 @@ def fetch_next(loader_iter, loader):
         return next(loader_iter), loader_iter
 
 
+def _set_batchnorm_eval(m: nn.Module):
+    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+        m.eval()
+
+
 def fda_source_to_target(source: torch.Tensor, target: torch.Tensor, beta: float = 0.01) -> torch.Tensor:
     """Fourier Domain Adaptation (FDA) from target->source.
 
@@ -237,9 +242,21 @@ def main():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     model.train()
 
+    freeze_bn = bool(getattr(args, "freeze_bn", False)) or bool(getattr(args, "finetune", False))
+    if freeze_bn:
+        model.apply(_set_batchnorm_eval)
+
     # FogPass
     lr_fpf1 = 5e-4 if args.modeltrain == "train" else 1e-3
     lr_fpf2 = 1e-3
+
+    if getattr(args, "fpf1_lr", None) is not None:
+        lr_fpf1 = float(args.fpf1_lr)
+    if getattr(args, "fpf2_lr", None) is not None:
+        lr_fpf2 = float(args.fpf2_lr)
+    lr_fpf_mult = float(getattr(args, "fpf_lr_mult", 1.0))
+    lr_fpf1 *= lr_fpf_mult
+    lr_fpf2 *= lr_fpf_mult
     FogPassFilter1 = FogPassFilter_conv1(2080).to(device)
     FogPassFilter2 = FogPassFilter_res1(32896).to(device)
     FogPassFilter1_optimizer = torch.optim.Adamax([p for p in FogPassFilter1.parameters() if p.requires_grad], lr=lr_fpf1)
@@ -296,6 +313,7 @@ def main():
 
     iter_source = tqdm(range(0, args.num_steps)) if is_main_process else range(0, args.num_steps)
     fda_beta = float(getattr(args, "fda_beta", 0.01))
+    freeze_fogpass_steps = int(getattr(args, "freeze_fogpass_steps", 0))
 
     for i_iter in iter_source:
         if is_distributed:
@@ -313,39 +331,40 @@ def main():
 
         for _sub_i in range(args.iter_size):
             # ===== Phase A: train fog-pass filtering modules (same as FIFO) =====
-            model.eval()
-            for p in model.parameters():
-                p.requires_grad = False
-            for p in FogPassFilter1.parameters():
-                p.requires_grad = True
-            for p in FogPassFilter2.parameters():
-                p.requires_grad = True
+            if i_iter >= freeze_fogpass_steps:
+                model.eval()
+                for p in model.parameters():
+                    p.requires_grad = False
+                for p in FogPassFilter1.parameters():
+                    p.requires_grad = True
+                for p in FogPassFilter2.parameters():
+                    p.requires_grad = True
 
-            batch, cwsf_pair_loader_iter_fogpass = fetch_next(cwsf_pair_loader_iter_fogpass, cwsf_pair_loader_fogpass)
-            sf_image, cw_image, label, size, _sf_name, _cw_name = batch
-            interp = nn.Upsample(size=(size[0][0], size[0][1]), mode="bilinear")
+                batch, cwsf_pair_loader_iter_fogpass = fetch_next(cwsf_pair_loader_iter_fogpass, cwsf_pair_loader_fogpass)
+                sf_image, cw_image, label, size, _sf_name, _cw_name = batch
+                interp = nn.Upsample(size=(size[0][0], size[0][1]), mode="bilinear")
 
-            batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
-            rf_img, _rf_size, _rf_name = batch_rf
+                batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
+                rf_img, _rf_size, _rf_name = batch_rf
 
-            with torch.no_grad():
-                with amp.autocast(enabled=bool(args.amp)):
-                    img_rf = rf_img.to(device)
-                    feature_rf0, feature_rf1, *_rest = model(img_rf)
+                with torch.no_grad():
+                    with amp.autocast(enabled=bool(args.amp)):
+                        img_rf = rf_img.to(device)
+                        feature_rf0, feature_rf1, *_rest = model(img_rf)
 
-                    images_sf = sf_image.to(device)
-                    feature_sf0, feature_sf1, *_rest2 = model(images_sf)
+                        images_sf = sf_image.to(device)
+                        feature_sf0, feature_sf1, *_rest2 = model(images_sf)
 
-                    images_cw = cw_image.to(device)
-                    feature_cw0, feature_cw1, *_rest3 = model(images_cw)
+                        images_cw = cw_image.to(device)
+                        feature_cw0, feature_cw1, *_rest3 = model(images_cw)
 
-            fsm_weights = {"layer0": 0.5, "layer1": 0.5}
-            sf_features = {"layer0": feature_sf0.detach(), "layer1": feature_sf1.detach()}
-            cw_features = {"layer0": feature_cw0.detach(), "layer1": feature_cw1.detach()}
-            rf_features = {"layer0": feature_rf0.detach(), "layer1": feature_rf1.detach()}
+                fsm_weights = {"layer0": 0.5, "layer1": 0.5}
+                sf_features = {"layer0": feature_sf0.detach(), "layer1": feature_sf1.detach()}
+                cw_features = {"layer0": feature_cw0.detach(), "layer1": feature_cw1.detach()}
+                rf_features = {"layer0": feature_rf0.detach(), "layer1": feature_rf1.detach()}
 
-            total_fpf_loss = 0
-            for idx, layer in enumerate(fsm_weights):
+                total_fpf_loss = 0
+                for idx, layer in enumerate(fsm_weights):
                 cw_feature = cw_features[layer]
                 sf_feature = sf_features[layer]
                 rf_feature = rf_features[layer]
@@ -384,16 +403,21 @@ def main():
                     wandb.log({f"layer{idx}/fpf loss": fog_pass_filter_loss}, step=i_iter)
                     wandb.log({f"layer{idx}/total fpf loss": total_fpf_loss}, step=i_iter)
 
-            scaler_fpf.scale(total_fpf_loss).backward()
-            scaler_fpf.step(FogPassFilter1_optimizer)
-            scaler_fpf.step(FogPassFilter2_optimizer)
-            scaler_fpf.update()
-            FogPassFilter1_optimizer.zero_grad(set_to_none=True)
-            FogPassFilter2_optimizer.zero_grad(set_to_none=True)
+                scaler_fpf.scale(total_fpf_loss).backward()
+                scaler_fpf.step(FogPassFilter1_optimizer)
+                scaler_fpf.step(FogPassFilter2_optimizer)
+                scaler_fpf.update()
+                FogPassFilter1_optimizer.zero_grad(set_to_none=True)
+                FogPassFilter2_optimizer.zero_grad(set_to_none=True)
+            else:
+                if is_main_process and i_iter == 0 and freeze_fogpass_steps > 0:
+                    print(f"[Freeze] FogPassFilter updates frozen for first {freeze_fogpass_steps} steps")
 
             # ===== Phase B: train segmentation network + FIFO losses, with FDA augmentation =====
             if args.modeltrain == "train":
                 model.train()
+                if freeze_bn:
+                    model.apply(_set_batchnorm_eval)
                 for p in model.parameters():
                     p.requires_grad = True
                 for p in FogPassFilter1.parameters():
@@ -522,10 +546,15 @@ def main():
                 scaler_seg.update()
 
         # snapshots
-        if i_iter < 20000:
-            save_pred_every = 2000 if args.modeltrain == "train" else 5000
+        early_every = int(getattr(args, "save_pred_every_early", 0))
+        early_until = int(getattr(args, "save_pred_early_until", 0))
+        if early_every > 0 and early_until > 0 and i_iter < early_until:
+            save_pred_every = early_every
         else:
-            save_pred_every = args.save_pred_every
+            if i_iter < 20000:
+                save_pred_every = 2000 if args.modeltrain == "train" else 5000
+            else:
+                save_pred_every = args.save_pred_every
 
         if i_iter >= args.num_steps_stop - 1:
             if is_main_process:

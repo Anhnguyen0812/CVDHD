@@ -89,6 +89,30 @@ def get_arguments():
 
     parser.add_argument("--freeze-bn", action="store_true",
                         help="Freeze BatchNorm running stats (set BN layers to eval) during training; useful for resume/finetune with small batch")
+
+    # Experiment knobs (optional; only used by specific main_*.py entrypoints)
+    parser.add_argument("--fda-beta", type=float, default=0.01,
+                        help="FDA: fraction of low-frequency spectrum to swap (typical 0.005-0.05)")
+
+    parser.add_argument("--boundary-lr", type=float, default=1e-3,
+                        help="BoundaryHead: learning rate")
+    parser.add_argument("--boundary-warmup-steps", type=int, default=1000,
+                        help="BoundaryHead: steps to train boundary head before joint finetune")
+    parser.add_argument("--boundary-weight", type=float, default=0.5,
+                        help="BoundaryHead: loss weight for boundary prediction")
+
+    parser.add_argument("--proto-head-lr", type=float, default=1e-3,
+                        help="ProtoCL: projection head learning rate")
+    parser.add_argument("--proto-weight", type=float, default=0.1,
+                        help="ProtoCL: loss weight")
+    parser.add_argument("--proto-temp", type=float, default=0.1,
+                        help="ProtoCL: softmax temperature")
+    parser.add_argument("--proto-momentum", type=float, default=0.99,
+                        help="ProtoCL: EMA momentum for prototype update")
+    parser.add_argument("--proto-init-iters", type=int, default=200,
+                        help="ProtoCL: number of labeled-source iters for prototype initialization")
+    parser.add_argument("--proto-sample-pixels", type=int, default=4096,
+                        help="ProtoCL: max pixels sampled per init iter")
     parser.add_argument("--file-name", type=str, required=True)
     parser.add_argument("--modeltrain", type=str, required=True)
     parser.add_argument("--distributed", action="store_true")

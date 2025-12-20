@@ -154,6 +154,11 @@ def fetch_next(loader_iter, loader):
         return next(loader_iter), loader_iter
 
 
+def _set_batchnorm_eval(m: nn.Module):
+    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+        m.eval()
+
+
 def _global_pool_embedding(feat: torch.Tensor) -> torch.Tensor:
     emb = F.adaptive_avg_pool2d(feat.float(), output_size=1).flatten(1)
     return F.normalize(emb, p=2, dim=1, eps=1e-6)
@@ -281,6 +286,10 @@ def main():
         student = DDP(student, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     student.train()
 
+    freeze_bn = bool(getattr(args, "freeze_bn", False)) or bool(getattr(args, "finetune", False))
+    if freeze_bn:
+        student.apply(_set_batchnorm_eval)
+
     # Teacher model (fixed) to init prototypes
     teacher = rf_lw101(num_classes=args.num_classes)
     if args.restore_from != RESTORE_FROM:
@@ -305,6 +314,14 @@ def main():
     # FogPass
     lr_fpf1 = 5e-4 if args.modeltrain == "train" else 1e-3
     lr_fpf2 = 1e-3
+
+    if getattr(args, "fpf1_lr", None) is not None:
+        lr_fpf1 = float(args.fpf1_lr)
+    if getattr(args, "fpf2_lr", None) is not None:
+        lr_fpf2 = float(args.fpf2_lr)
+    lr_fpf_mult = float(getattr(args, "fpf_lr_mult", 1.0))
+    lr_fpf1 *= lr_fpf_mult
+    lr_fpf2 *= lr_fpf_mult
     FogPassFilter1 = FogPassFilter_conv1(2080).to(device)
     FogPassFilter2 = FogPassFilter_res1(32896).to(device)
     FogPassFilter1_optimizer = torch.optim.Adamax([p for p in FogPassFilter1.parameters() if p.requires_grad], lr=lr_fpf1)
@@ -382,6 +399,7 @@ def main():
     )
 
     iter_source = tqdm(range(0, args.num_steps)) if is_main_process else range(0, args.num_steps)
+    freeze_fogpass_steps = int(getattr(args, "freeze_fogpass_steps", 0))
     for i_iter in iter_source:
         if is_distributed:
             if cwsf_pair_sampler:
@@ -400,78 +418,84 @@ def main():
 
         for _sub_i in range(args.iter_size):
             # ===== Phase A: fog-pass filtering modules =====
-            student.eval()
-            for p in student.parameters():
-                p.requires_grad = False
-            for p in FogPassFilter1.parameters():
-                p.requires_grad = True
-            for p in FogPassFilter2.parameters():
-                p.requires_grad = True
+            if i_iter >= freeze_fogpass_steps:
+                student.eval()
+                for p in student.parameters():
+                    p.requires_grad = False
+                for p in FogPassFilter1.parameters():
+                    p.requires_grad = True
+                for p in FogPassFilter2.parameters():
+                    p.requires_grad = True
 
-            batch, cwsf_pair_loader_iter_fogpass = fetch_next(cwsf_pair_loader_iter_fogpass, cwsf_pair_loader_fogpass)
-            sf_image, cw_image, label, size, _sf_name, _cw_name = batch
+                batch, cwsf_pair_loader_iter_fogpass = fetch_next(cwsf_pair_loader_iter_fogpass, cwsf_pair_loader_fogpass)
+                sf_image, cw_image, label, size, _sf_name, _cw_name = batch
 
-            batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
-            rf_img, _rf_size, _rf_name = batch_rf
+                batch_rf, rf_loader_iter_fogpass = fetch_next(rf_loader_iter_fogpass, rf_loader_fogpass)
+                rf_img, _rf_size, _rf_name = batch_rf
 
-            with torch.no_grad():
-                with amp.autocast(enabled=bool(args.amp)):
-                    img_rf = rf_img.to(device)
-                    feature_rf0, feature_rf1, *_rest = student(img_rf)
-                    images_sf = sf_image.to(device)
-                    feature_sf0, feature_sf1, *_rest2 = student(images_sf)
-                    images_cw = cw_image.to(device)
-                    feature_cw0, feature_cw1, *_rest3 = student(images_cw)
+                with torch.no_grad():
+                    with amp.autocast(enabled=bool(args.amp)):
+                        img_rf = rf_img.to(device)
+                        feature_rf0, feature_rf1, *_rest = student(img_rf)
+                        images_sf = sf_image.to(device)
+                        feature_sf0, feature_sf1, *_rest2 = student(images_sf)
+                        images_cw = cw_image.to(device)
+                        feature_cw0, feature_cw1, *_rest3 = student(images_cw)
 
-            fsm_weights = {"layer0": 0.5, "layer1": 0.5}
-            sf_features = {"layer0": feature_sf0.detach(), "layer1": feature_sf1.detach()}
-            cw_features = {"layer0": feature_cw0.detach(), "layer1": feature_cw1.detach()}
-            rf_features = {"layer0": feature_rf0.detach(), "layer1": feature_rf1.detach()}
+                fsm_weights = {"layer0": 0.5, "layer1": 0.5}
+                sf_features = {"layer0": feature_sf0.detach(), "layer1": feature_sf1.detach()}
+                cw_features = {"layer0": feature_cw0.detach(), "layer1": feature_cw1.detach()}
+                rf_features = {"layer0": feature_rf0.detach(), "layer1": feature_rf1.detach()}
 
-            total_fpf_loss = 0
-            for idx, layer in enumerate(fsm_weights):
-                cw_feature = cw_features[layer]
-                sf_feature = sf_features[layer]
-                rf_feature = rf_features[layer]
+                total_fpf_loss = 0
+                for idx, layer in enumerate(fsm_weights):
+                    cw_feature = cw_features[layer]
+                    sf_feature = sf_features[layer]
+                    rf_feature = rf_features[layer]
 
-                fogpassfilter = FogPassFilter1 if idx == 0 else FogPassFilter2
-                fogpassfilter_optimizer = FogPassFilter1_optimizer if idx == 0 else FogPassFilter2_optimizer
-                fogpassfilter.train()
-                fogpassfilter_optimizer.zero_grad(set_to_none=True)
+                    fogpassfilter = FogPassFilter1 if idx == 0 else FogPassFilter2
+                    fogpassfilter_optimizer = FogPassFilter1_optimizer if idx == 0 else FogPassFilter2_optimizer
+                    fogpassfilter.train()
+                    fogpassfilter_optimizer.zero_grad(set_to_none=True)
 
-                actual_batch = sf_feature.size(0)
-                fog_factor_list = []
-                fog_factor_labels_list = []
-                for batch_idx in range(actual_batch):
-                    sf_g = gram_matrix(sf_feature[batch_idx])
-                    cw_g = gram_matrix(cw_feature[batch_idx])
-                    rf_g = gram_matrix(rf_feature[batch_idx])
-                    vec_sf = upper_triangular_vector(sf_g).requires_grad_()
-                    vec_cw = upper_triangular_vector(cw_g).requires_grad_()
-                    vec_rf = upper_triangular_vector(rf_g).requires_grad_()
-                    fog_factor_list.append(fogpassfilter(vec_sf).unsqueeze(0))
-                    fog_factor_list.append(fogpassfilter(vec_cw).unsqueeze(0))
-                    fog_factor_list.append(fogpassfilter(vec_rf).unsqueeze(0))
-                    fog_factor_labels_list.extend([0, 1, 2])
+                    actual_batch = sf_feature.size(0)
+                    fog_factor_list = []
+                    fog_factor_labels_list = []
+                    for batch_idx in range(actual_batch):
+                        sf_g = gram_matrix(sf_feature[batch_idx])
+                        cw_g = gram_matrix(cw_feature[batch_idx])
+                        rf_g = gram_matrix(rf_feature[batch_idx])
+                        vec_sf = upper_triangular_vector(sf_g).requires_grad_()
+                        vec_cw = upper_triangular_vector(cw_g).requires_grad_()
+                        vec_rf = upper_triangular_vector(rf_g).requires_grad_()
+                        fog_factor_list.append(fogpassfilter(vec_sf).unsqueeze(0))
+                        fog_factor_list.append(fogpassfilter(vec_cw).unsqueeze(0))
+                        fog_factor_list.append(fogpassfilter(vec_rf).unsqueeze(0))
+                        fog_factor_labels_list.extend([0, 1, 2])
 
-                fog_factor_embeddings = torch.cat(fog_factor_list, dim=0)
-                fog_factor_embeddings = fog_factor_embeddings / torch.norm(fog_factor_embeddings, p=2, dim=1).unsqueeze(1).clamp(
-                    min=1e-6
-                )
-                fog_factor_labels = torch.LongTensor(fog_factor_labels_list).to(device)
-                fog_pass_filter_loss = fogpassfilter_loss(fog_factor_embeddings, fog_factor_labels)
-                total_fpf_loss = total_fpf_loss + fog_pass_filter_loss
+                    fog_factor_embeddings = torch.cat(fog_factor_list, dim=0)
+                    fog_factor_embeddings = fog_factor_embeddings / torch.norm(fog_factor_embeddings, p=2, dim=1).unsqueeze(1).clamp(
+                        min=1e-6
+                    )
+                    fog_factor_labels = torch.LongTensor(fog_factor_labels_list).to(device)
+                    fog_pass_filter_loss = fogpassfilter_loss(fog_factor_embeddings, fog_factor_labels)
+                    total_fpf_loss = total_fpf_loss + fog_pass_filter_loss
 
-            scaler_fpf.scale(total_fpf_loss).backward()
-            scaler_fpf.step(FogPassFilter1_optimizer)
-            scaler_fpf.step(FogPassFilter2_optimizer)
-            scaler_fpf.update()
-            FogPassFilter1_optimizer.zero_grad(set_to_none=True)
-            FogPassFilter2_optimizer.zero_grad(set_to_none=True)
+                scaler_fpf.scale(total_fpf_loss).backward()
+                scaler_fpf.step(FogPassFilter1_optimizer)
+                scaler_fpf.step(FogPassFilter2_optimizer)
+                scaler_fpf.update()
+                FogPassFilter1_optimizer.zero_grad(set_to_none=True)
+                FogPassFilter2_optimizer.zero_grad(set_to_none=True)
+            else:
+                if is_main_process and i_iter == 0 and freeze_fogpass_steps > 0:
+                    print(f"[Freeze] FogPassFilter updates frozen for first {freeze_fogpass_steps} steps")
 
             # ===== Phase B: segmentation + prototype contrastive =====
             if args.modeltrain == "train":
                 student.train()
+                if freeze_bn:
+                    student.apply(_set_batchnorm_eval)
                 for p in student.parameters():
                     p.requires_grad = True
                 for p in FogPassFilter1.parameters():
@@ -623,10 +647,15 @@ def main():
                     wandb.log({"total_loss": float(loss.detach().cpu())}, step=i_iter)
 
         # snapshots
-        if i_iter < 20000:
-            save_pred_every = 2000 if args.modeltrain == "train" else 5000
+        early_every = int(getattr(args, "save_pred_every_early", 0))
+        early_until = int(getattr(args, "save_pred_early_until", 0))
+        if early_every > 0 and early_until > 0 and i_iter < early_until:
+            save_pred_every = early_every
         else:
-            save_pred_every = args.save_pred_every
+            if i_iter < 20000:
+                save_pred_every = 2000 if args.modeltrain == "train" else 5000
+            else:
+                save_pred_every = args.save_pred_every
 
         if i_iter >= args.num_steps_stop - 1:
             if is_main_process:
