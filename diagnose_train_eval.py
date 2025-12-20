@@ -56,6 +56,65 @@ def parse_steps(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
+def _fmt(v: float | None) -> str:
+    if v is None:
+        return "NA"
+    return f"{v:.2f}"
+
+
+def _delta(v: float | None, base: float | None) -> float | None:
+    if v is None or base is None:
+        return None
+    return v - base
+
+
+def _print_results_table(rows: list[dict]) -> None:
+    headers = [
+        "exp",
+        "FZ",
+        "FDD",
+        "FD",
+        "Lindau",
+        "dFZ",
+        "dFDD",
+        "dFD",
+        "dLindau",
+    ]
+
+    def cell(r: dict, k: str) -> str:
+        v = r.get(k)
+        if isinstance(v, float):
+            return f"{v:.2f}"
+        return str(v) if v is not None else "NA"
+
+    widths = {h: max(len(h), max(len(cell(r, h)) for r in rows)) for h in headers}
+    line = " | ".join(h.ljust(widths[h]) for h in headers)
+    sep = "-+-".join("-" * widths[h] for h in headers)
+    print("\n" + line)
+    print(sep)
+    for r in rows:
+        print(" | ".join(cell(r, h).ljust(widths[h]) for h in headers))
+
+
+def _replace_or_add_flag(tokens: list[str], flag: str, value: str | None) -> list[str]:
+    """Replace occurrences of --flag <val>. If value is None, remove the flag+val.
+
+    This is a simple token-level helper (works for flags that always take a value).
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i] == flag and i + 1 < len(tokens):
+            # skip existing
+            i += 2
+            continue
+        out.append(tokens[i])
+        i += 1
+    if value is not None:
+        out += [flag, value]
+    return out
+
+
 def find_ckpt_for_step(exp_name: str, step: int, snapshot_dirs: list[str]) -> str | None:
     # training saves: <snapshot_dir>/<run_name>_FIFO{step}.pth, where run_name = "{file-name}-{MM-DD-HH-MM}"
     patterns = [str(Path(d) / f"*{exp_name}*FIFO{step}.pth") for d in snapshot_dirs]
@@ -154,6 +213,80 @@ def eval_ckpt(tag: str, ckpt_path: str, gpu: str) -> dict:
     return metrics
 
 
+def _build_train_cmd(
+    *,
+    train_script: str,
+    exp_name: str,
+    base_ckpt: str,
+    gpu: str,
+    num_steps: int,
+    num_steps_stop: int,
+    backbone_lr_mult: str,
+    head_lr_mult: str,
+    lambda_cl: str,
+    cl_warmup_steps: str,
+    cl_temp: str,
+    cl_head_lr: str,
+    freeze_fogpass_steps: str,
+    fpf_lr_mult: str,
+    save_pred_every_early: str,
+    save_pred_early_until: str,
+    amp: str,
+    finetune: bool,
+    freeze_bn: bool,
+    save_dir: str,
+    extra_tokens: list[str],
+) -> list[str]:
+    cmd = [
+        "python",
+        train_script,
+        "--modeltrain",
+        "train",
+        "--file-name",
+        exp_name,
+        "--restore-from",
+        base_ckpt,
+        "--restore-from-fogpass",
+        base_ckpt,
+        "--num-steps",
+        str(num_steps),
+        "--num-steps-stop",
+        str(num_steps_stop),
+        "--backbone-lr-mult",
+        str(backbone_lr_mult),
+        "--head-lr-mult",
+        str(head_lr_mult),
+        "--lambda-cl",
+        str(lambda_cl),
+        "--cl-warmup-steps",
+        str(cl_warmup_steps),
+        "--cl-temp",
+        str(cl_temp),
+        "--cl-head-lr",
+        str(cl_head_lr),
+        "--freeze-fogpass-steps",
+        str(freeze_fogpass_steps),
+        "--fpf-lr-mult",
+        str(fpf_lr_mult),
+        "--save-pred-every-early",
+        str(save_pred_every_early),
+        "--save-pred-early-until",
+        str(save_pred_early_until),
+        "--amp",
+        str(amp),
+        "--gpu",
+        str(gpu),
+    ]
+    if finetune:
+        cmd.append("--finetune")
+    if freeze_bn:
+        cmd.append("--freeze-bn")
+    if save_dir:
+        cmd += ["--save-dir", save_dir]
+    cmd += extra_tokens
+    return cmd
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
 
@@ -197,6 +330,11 @@ def main() -> int:
 
     ap.add_argument("--amp", default="1")
 
+    # Ablation sweep: runs several short finetunes and compares deltas vs baseline
+    ap.add_argument("--sweep", action="store_true", help="Run a small ablation sweep after baseline eval")
+    ap.add_argument("--sweep-num-steps", type=int, default=10, help="Train steps per variant when --sweep is set")
+    ap.add_argument("--sweep-num-steps-stop", type=int, default=10, help="Stop steps per variant when --sweep is set")
+
     args = ap.parse_args()
 
     repo = Path(args.repo_dir)
@@ -225,55 +363,133 @@ def main() -> int:
     base_metrics = eval_ckpt(f"{args.exp_name}_BASE", args.base_ckpt, args.gpu)
     print(base_metrics)
 
-    # Train
-    common = [
-        "--modeltrain",
-        "train",
-        "--file-name",
-        args.exp_name,
-        "--restore-from",
-        args.base_ckpt,
-        "--restore-from-fogpass",
-        args.base_ckpt,
-        "--num-steps",
-        str(args.num_steps),
-        "--num-steps-stop",
-        str(args.num_steps_stop),
-        "--backbone-lr-mult",
-        str(args.backbone_lr_mult),
-        "--head-lr-mult",
-        str(args.head_lr_mult),
-        "--lambda-cl",
-        str(args.lambda_cl),
-        "--cl-warmup-steps",
-        str(args.cl_warmup_steps),
-        "--cl-temp",
-        str(args.cl_temp),
-        "--cl-head-lr",
-        str(args.cl_head_lr),
-        "--freeze-fogpass-steps",
-        str(args.freeze_fogpass_steps),
-        "--fpf-lr-mult",
-        str(args.fpf_lr_mult),
-        "--save-pred-every-early",
-        str(args.save_pred_every_early),
-        "--save-pred-early-until",
-        str(args.save_pred_early_until),
-        "--amp",
-        str(args.amp),
-        "--gpu",
-        str(args.gpu),
-    ]
-    if args.finetune:
-        common.append("--finetune")
-    if args.freeze_bn:
-        common.append("--freeze-bn")
-    if args.save_dir:
-        common += ["--save-dir", args.save_dir]
+    # Optional ablation sweep (recommended to diagnose 'why mIoU drops')
+    if bool(getattr(args, "sweep", False)):
+        base_extra_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
 
+        # Ensure we have an explicit fda-beta if the user is using main_fda.py.
+        # train_config.py defaults may change; keep sweep explicit.
+        if "fda" in args.train_script.lower():
+            base_extra_tokens = _replace_or_add_flag(base_extra_tokens, "--fda-beta", "0.01")
+
+        variants: list[tuple[str, dict]] = []
+
+        # Variant 1: disable FDA (beta=0 => fda_source_to_target returns original)
+        if "fda" in args.train_script.lower():
+            variants.append(("FDA_beta0", {"extra_tokens": _replace_or_add_flag(base_extra_tokens, "--fda-beta", "0")}))
+
+        # Variant 2: keep FDA but do NOT freeze BN
+        variants.append(("noFreezeBN", {"freeze_bn": False, "extra_tokens": list(base_extra_tokens)}))
+
+        # Variant 3: lower LR multipliers
+        variants.append(("lowLR", {"backbone_lr_mult": "0.005", "head_lr_mult": "0.01", "extra_tokens": list(base_extra_tokens)}))
+
+        # Variant 4: do not freeze fogpass
+        variants.append(("noFreezeFPF", {"freeze_fogpass_steps": "0", "extra_tokens": list(base_extra_tokens)}))
+
+        rows: list[dict] = []
+        rows.append(
+            {
+                "exp": "BASE",
+                "FZ": base_metrics.get("FZ"),
+                "FDD": base_metrics.get("FDD"),
+                "FD": base_metrics.get("FD"),
+                "Lindau": base_metrics.get("Lindau"),
+                "dFZ": 0.0,
+                "dFDD": 0.0,
+                "dFD": 0.0,
+                "dLindau": 0.0,
+            }
+        )
+
+        for suffix, cfg in variants:
+            v_exp = f"{args.exp_name}_{suffix}"
+            v_num_steps = int(getattr(args, "sweep_num_steps", 10))
+            v_num_stop = int(getattr(args, "sweep_num_steps_stop", 10))
+
+            v_cmd = _build_train_cmd(
+                train_script=args.train_script,
+                exp_name=v_exp,
+                base_ckpt=args.base_ckpt,
+                gpu=args.gpu,
+                num_steps=v_num_steps,
+                num_steps_stop=v_num_stop,
+                backbone_lr_mult=str(cfg.get("backbone_lr_mult", args.backbone_lr_mult)),
+                head_lr_mult=str(cfg.get("head_lr_mult", args.head_lr_mult)),
+                lambda_cl=str(args.lambda_cl),
+                cl_warmup_steps=str(args.cl_warmup_steps),
+                cl_temp=str(args.cl_temp),
+                cl_head_lr=str(args.cl_head_lr),
+                freeze_fogpass_steps=str(cfg.get("freeze_fogpass_steps", args.freeze_fogpass_steps)),
+                fpf_lr_mult=str(args.fpf_lr_mult),
+                save_pred_every_early=str(args.save_pred_every_early),
+                save_pred_early_until=str(args.save_pred_early_until),
+                amp=str(args.amp),
+                finetune=bool(args.finetune),
+                freeze_bn=bool(cfg.get("freeze_bn", args.freeze_bn)),
+                save_dir=str(args.save_dir),
+                extra_tokens=list(cfg.get("extra_tokens", base_extra_tokens)),
+            )
+
+            run(v_cmd, title=f"SWEEP TRAIN {v_exp} ({suffix})")
+
+            # Evaluate final checkpoint (preferred) else fall back to latest FIFO snapshot
+            final_name = f"{v_exp}{v_num_stop}.pth"
+            final_paths = [str(Path(d) / final_name) for d in snapshot_dirs]
+            final_paths = [p for p in final_paths if os.path.exists(p)]
+            ckpt = final_paths[0] if final_paths else find_latest_ckpt(v_exp, snapshot_dirs)
+            if not ckpt:
+                print(f"[SWEEP-WARN] No checkpoint found for {v_exp}")
+                rows.append({"exp": suffix, "FZ": None, "FDD": None, "FD": None, "Lindau": None, "dFZ": None, "dFDD": None, "dFD": None, "dLindau": None})
+                continue
+
+            v_metrics = eval_ckpt(f"{v_exp}_FINAL", ckpt, args.gpu)
+            rows.append(
+                {
+                    "exp": suffix,
+                    "FZ": v_metrics.get("FZ"),
+                    "FDD": v_metrics.get("FDD"),
+                    "FD": v_metrics.get("FD"),
+                    "Lindau": v_metrics.get("Lindau"),
+                    "dFZ": _delta(v_metrics.get("FZ"), base_metrics.get("FZ")),
+                    "dFDD": _delta(v_metrics.get("FDD"), base_metrics.get("FDD")),
+                    "dFD": _delta(v_metrics.get("FD"), base_metrics.get("FD")),
+                    "dLindau": _delta(v_metrics.get("Lindau"), base_metrics.get("Lindau")),
+                }
+            )
+
+        print("\n" + "=" * 10 + " SWEEP SUMMARY " + "=" * 10)
+        _print_results_table(rows)
+        print("\nDone.")
+        return 0
+
+    # Train (single run mode)
     extra = args.train_extra.strip().split() if args.train_extra.strip() else []
+    train_cmd = _build_train_cmd(
+        train_script=args.train_script,
+        exp_name=args.exp_name,
+        base_ckpt=args.base_ckpt,
+        gpu=args.gpu,
+        num_steps=int(args.num_steps),
+        num_steps_stop=int(args.num_steps_stop),
+        backbone_lr_mult=str(args.backbone_lr_mult),
+        head_lr_mult=str(args.head_lr_mult),
+        lambda_cl=str(args.lambda_cl),
+        cl_warmup_steps=str(args.cl_warmup_steps),
+        cl_temp=str(args.cl_temp),
+        cl_head_lr=str(args.cl_head_lr),
+        freeze_fogpass_steps=str(args.freeze_fogpass_steps),
+        fpf_lr_mult=str(args.fpf_lr_mult),
+        save_pred_every_early=str(args.save_pred_every_early),
+        save_pred_early_until=str(args.save_pred_early_until),
+        amp=str(args.amp),
+        finetune=bool(args.finetune),
+        freeze_bn=bool(args.freeze_bn),
+        save_dir=str(args.save_dir),
+        extra_tokens=extra,
+    )
 
-    run(["python", args.train_script] + common + extra, title=f"TRAIN {args.exp_name} ({args.train_script})")
+    run(train_cmd, title=f"TRAIN {args.exp_name} ({args.train_script})")
 
     # Evaluate snapshots
     steps = parse_steps(args.steps)
