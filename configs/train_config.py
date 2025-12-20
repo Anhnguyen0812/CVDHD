@@ -56,6 +56,10 @@ def get_arguments():
     parser.add_argument("--set", type=str, default=SET)
     parser.add_argument("--lambda-fsm", type=float, default=0.0000001)
     parser.add_argument("--lambda-con", type=float, default=0.0001)
+    parser.add_argument("--lambda-cl", type=float, default=0.01,
+                        help="Weight for image-level contrastive loss (SimCLR/NT-Xent) between paired domains")
+    parser.add_argument("--cl-temp", type=float, default=0.1,
+                        help="Temperature for contrastive loss")
     parser.add_argument("--file-name", type=str, required=True)
     parser.add_argument("--modeltrain", type=str, required=True)
     parser.add_argument("--distributed", action="store_true")

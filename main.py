@@ -99,6 +99,14 @@ def gram_matrix(tensor):
     return gram
 
 
+def _global_pool_embedding(feat: torch.Tensor) -> torch.Tensor:
+    """Convert a feature map (N,C,H,W) to L2-normalized embeddings (N,C)."""
+    if feat.dim() != 4:
+        raise ValueError(f"Expected feature map of shape (N,C,H,W), got {tuple(feat.shape)}")
+    emb = F.adaptive_avg_pool2d(feat.float(), output_size=1).flatten(1)
+    return F.normalize(emb, p=2, dim=1, eps=1e-6)
+
+
 def upper_triangular_vector(square_matrix):
     """Return the upper-triangular (including diagonal) entries as a 1D vector.
 
@@ -275,6 +283,9 @@ def main():
         reducer=MeanReducer()
         )
 
+    # Image-level contrastive learning between paired domains (SimCLR-style)
+    contrastive_loss_fn = losses.NTXentLoss(temperature=float(getattr(args, "cl_temp", 0.1)))
+
     cudnn.benchmark = True
 
     if is_main_process and not os.path.exists(snapshot_dir):
@@ -326,6 +337,7 @@ def main():
         loss_seg_sf_value = 0
         loss_fsm_value = 0
         loss_con_value = 0
+        loss_cl_value = 0
 
         for opt in opts:
             opt.zero_grad()
@@ -459,6 +471,19 @@ def main():
                         sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}                
                         cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
 
+                    # Contrastive loss between SF and CW (paired by index)
+                    cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    if cl_lambda > 0:
+                        # Use a higher-level feature map for embeddings
+                        emb_a = _global_pool_embedding(feature_sf4)
+                        emb_b = _global_pool_embedding(feature_cw4)
+                        n = emb_a.size(0)
+                        emb = torch.cat([emb_a, emb_b], dim=0)
+                        cl_labels = torch.arange(n, device=device, dtype=torch.long).repeat(2)
+                        loss_cl = contrastive_loss_fn(emb, cl_labels)
+                    else:
+                        loss_cl = 0
+
                 if i_iter % 3 == 1:
                     batch_rf, rf_loader_iter = fetch_next(rf_loader_iter, rf_loader)
                     rf_img,rf_size, rf_name = batch_rf
@@ -474,6 +499,18 @@ def main():
                         rf_features = {'layer0':feature_rf0, 'layer1':feature_rf1}
                         sf_features = {'layer0':feature_sf0, 'layer1':feature_sf1}
                         fsm_weights = {'layer0':0.5, 'layer1':0.5}
+
+                    # Contrastive loss between SF and RF
+                    cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    if cl_lambda > 0:
+                        emb_a = _global_pool_embedding(feature_sf4)
+                        emb_b = _global_pool_embedding(feature_rf4)
+                        n = emb_a.size(0)
+                        emb = torch.cat([emb_a, emb_b], dim=0)
+                        cl_labels = torch.arange(n, device=device, dtype=torch.long).repeat(2)
+                        loss_cl = contrastive_loss_fn(emb, cl_labels)
+                    else:
+                        loss_cl = 0
                 
                 if i_iter % 3 == 2:
                     batch_rf, rf_loader_iter = fetch_next(rf_loader_iter, rf_loader)
@@ -490,6 +527,18 @@ def main():
                         rf_features = {'layer0':feature_rf0, 'layer1':feature_rf1}
                         cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
                         fsm_weights = {'layer0':0.5, 'layer1':0.5}
+
+                    # Contrastive loss between CW and RF
+                    cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    if cl_lambda > 0:
+                        emb_a = _global_pool_embedding(feature_cw4)
+                        emb_b = _global_pool_embedding(feature_rf4)
+                        n = emb_a.size(0)
+                        emb = torch.cat([emb_a, emb_b], dim=0)
+                        cl_labels = torch.arange(n, device=device, dtype=torch.long).repeat(2)
+                        loss_cl = contrastive_loss_fn(emb, cl_labels)
+                    else:
+                        loss_cl = 0
 
                 loss_fsm = 0
                 fog_pass_filter_loss = 0
@@ -539,7 +588,8 @@ def main():
 
                     loss_fsm += layer_fsm_loss / float(actual_batch_fsm)
 
-                loss = loss_seg_sf + loss_seg_cw + args.lambda_fsm*loss_fsm + args.lambda_con*loss_con  
+                cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                loss = loss_seg_sf + loss_seg_cw + args.lambda_fsm*loss_fsm + args.lambda_con*loss_con + cl_lambda*loss_cl
                 loss = loss / args.iter_size
                 scaler_seg.scale(loss).backward()
 
@@ -551,6 +601,8 @@ def main():
                     loss_fsm_value += loss_fsm.data.cpu().numpy() / args.iter_size
                 if loss_con != 0:
                     loss_con_value += loss_con.data.cpu().numpy() / args.iter_size
+                if loss_cl != 0:
+                    loss_cl_value += float(loss_cl.detach().cpu().item()) / args.iter_size
 
             
                 if is_main_process:
@@ -558,6 +610,7 @@ def main():
                     wandb.log({'SF_loss_seg': loss_seg_sf_value}, step=i_iter)
                     wandb.log({'CW_loss_seg': loss_seg_cw_value}, step=i_iter)
                     wandb.log({'consistency loss':args.lambda_con*loss_con_value}, step=i_iter)
+                    wandb.log({'contrastive loss': float(getattr(args, "lambda_cl", 0.0))*loss_cl_value}, step=i_iter)
                     wandb.log({'total_loss': loss}, step=i_iter)           
 
                 for opt in opts:
