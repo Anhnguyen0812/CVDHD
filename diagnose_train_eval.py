@@ -373,8 +373,13 @@ def main() -> int:
         safe_stop = safe_steps
 
         # Conservative multipliers to reduce drift.
-        safe_backbone_mult = "0.002"
-        safe_head_mult = "0.005"
+        safe_backbone_mult = "0.001"
+        safe_head_mult = "0.002"
+
+        # Save dense snapshots so we can pick the best checkpoint within these few steps.
+        # (Ending checkpoint is often slightly worse even if an earlier one is better.)
+        safe_snapshot_every = "20" if safe_steps >= 20 else str(max(1, safe_steps // 2))
+        safe_snapshot_until = str(safe_steps + 1)
 
         safe_extra_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
         # Force-disable FDA in safe mode for main_fda.py (beta=0 makes FDA a no-op)
@@ -397,8 +402,8 @@ def main() -> int:
             cl_head_lr=str(args.cl_head_lr),
             freeze_fogpass_steps=str(max(2000, safe_steps)),
             fpf_lr_mult=str(args.fpf_lr_mult),
-            save_pred_every_early=str(args.save_pred_every_early),
-            save_pred_early_until=str(args.save_pred_early_until),
+            save_pred_every_early=safe_snapshot_every,
+            save_pred_early_until=safe_snapshot_until,
             amp=str(args.amp),
             finetune=bool(args.finetune),
             freeze_bn=True,
@@ -408,44 +413,69 @@ def main() -> int:
 
         run(safe_cmd, title=f"SAFE TRAIN {args.exp_name}_SAFE ({safe_steps} steps)")
 
-        # Evaluate final checkpoint for safe run
-        final_name = f"{args.exp_name}_SAFE{safe_stop}.pth"
-        final_paths = [str(Path(d) / final_name) for d in snapshot_dirs]
-        final_paths = [p for p in final_paths if os.path.exists(p)]
-        ckpt = final_paths[0] if final_paths else find_latest_ckpt(f"{args.exp_name}_SAFE", snapshot_dirs)
-        if not ckpt:
-            print(f"[SAFE-WARN] No checkpoint found for {args.exp_name}_SAFE")
-            return 1
+        # Evaluate multiple checkpoints within safe run (including final)
+        safe_rows: list[dict] = []
+        safe_steps_to_eval: list[int] = []
+        try:
+            every = int(safe_snapshot_every)
+            if every > 0:
+                safe_steps_to_eval = list(range(every, safe_steps + 1, every))
+        except Exception:
+            safe_steps_to_eval = []
+        if safe_steps not in safe_steps_to_eval:
+            safe_steps_to_eval.append(safe_steps)
 
-        safe_metrics = eval_ckpt(f"{args.exp_name}_SAFE_FINAL", ckpt, args.gpu)
-        row = {
-            "exp": "SAFE",
-            "FZ": safe_metrics.get("FZ"),
-            "FDD": safe_metrics.get("FDD"),
-            "FD": safe_metrics.get("FD"),
-            "Lindau": safe_metrics.get("Lindau"),
-            "dFZ": _delta(safe_metrics.get("FZ"), base_metrics.get("FZ")),
-            "dFDD": _delta(safe_metrics.get("FDD"), base_metrics.get("FDD")),
-            "dFD": _delta(safe_metrics.get("FD"), base_metrics.get("FD")),
-            "dLindau": _delta(safe_metrics.get("Lindau"), base_metrics.get("Lindau")),
-        }
-        print("\n" + "=" * 10 + " SAFE SUMMARY " + "=" * 10)
-        _print_results_table(
-            [
+        for st in safe_steps_to_eval:
+            # Prefer FIFO snapshots when available; fall back to final checkpoint.
+            ckpt = find_ckpt_for_step(f"{args.exp_name}_SAFE", st, snapshot_dirs)
+            if not ckpt and st == safe_steps:
+                final_name = f"{args.exp_name}_SAFE{safe_stop}.pth"
+                final_paths = [str(Path(d) / final_name) for d in snapshot_dirs]
+                final_paths = [p for p in final_paths if os.path.exists(p)]
+                ckpt = final_paths[0] if final_paths else None
+            if not ckpt:
+                continue
+            m = eval_ckpt(f"{args.exp_name}_SAFE_step{st}", ckpt, args.gpu)
+            safe_rows.append(
                 {
-                    "exp": "BASE",
-                    "FZ": base_metrics.get("FZ"),
-                    "FDD": base_metrics.get("FDD"),
-                    "FD": base_metrics.get("FD"),
-                    "Lindau": base_metrics.get("Lindau"),
-                    "dFZ": 0.0,
-                    "dFDD": 0.0,
-                    "dFD": 0.0,
-                    "dLindau": 0.0,
-                },
-                row,
-            ]
-        )
+                    "exp": f"SAFE@{st}",
+                    "FZ": m.get("FZ"),
+                    "FDD": m.get("FDD"),
+                    "FD": m.get("FD"),
+                    "Lindau": m.get("Lindau"),
+                    "dFZ": _delta(m.get("FZ"), base_metrics.get("FZ")),
+                    "dFDD": _delta(m.get("FDD"), base_metrics.get("FDD")),
+                    "dFD": _delta(m.get("FD"), base_metrics.get("FD")),
+                    "dLindau": _delta(m.get("Lindau"), base_metrics.get("Lindau")),
+                }
+            )
+
+        # Choose best by FDD (primary), then FZ as tiebreak
+        best = None
+        for r in safe_rows:
+            fdd = r.get("FDD")
+            fz = r.get("FZ")
+            if fdd is None:
+                continue
+            score = (float(fdd), float(fz) if fz is not None else -1e9)
+            if best is None or score > best[0]:
+                best = (score, r)
+        print("\n" + "=" * 10 + " SAFE SUMMARY " + "=" * 10)
+        base_row = {
+            "exp": "BASE",
+            "FZ": base_metrics.get("FZ"),
+            "FDD": base_metrics.get("FDD"),
+            "FD": base_metrics.get("FD"),
+            "Lindau": base_metrics.get("Lindau"),
+            "dFZ": 0.0,
+            "dFDD": 0.0,
+            "dFD": 0.0,
+            "dLindau": 0.0,
+        }
+        rows_out = [base_row] + safe_rows
+        _print_results_table(rows_out)
+        if best is not None:
+            print(f"\nBest SAFE checkpoint by FDD: {best[1]['exp']}  FDD={best[1]['FDD']:.2f}  dFDD={best[1]['dFDD']:.2f}")
         print("\nDone.")
         return 0
 
