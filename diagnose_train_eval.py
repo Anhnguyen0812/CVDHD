@@ -330,6 +330,10 @@ def main() -> int:
 
     ap.add_argument("--amp", default="1")
 
+    # Safe quick run: tries hard to avoid mIoU drop (good for debugging before long runs)
+    ap.add_argument("--safe", action="store_true", help="Run a conservative short finetune and compare to baseline")
+    ap.add_argument("--safe-steps", type=int, default=100, help="Train steps for --safe mode")
+
     # Ablation sweep: runs several short finetunes and compares deltas vs baseline
     ap.add_argument("--sweep", action="store_true", help="Run a small ablation sweep after baseline eval")
     ap.add_argument("--sweep-num-steps", type=int, default=10, help="Train steps per variant when --sweep is set")
@@ -362,6 +366,88 @@ def main() -> int:
     print("\n[2] Baseline evaluation (before finetune):")
     base_metrics = eval_ckpt(f"{args.exp_name}_BASE", args.base_ckpt, args.gpu)
     print(base_metrics)
+
+    # Safe short finetune (aim: no drop)
+    if bool(getattr(args, "safe", False)):
+        safe_steps = int(getattr(args, "safe_steps", 100))
+        safe_stop = safe_steps
+
+        # Conservative multipliers to reduce drift.
+        safe_backbone_mult = "0.002"
+        safe_head_mult = "0.005"
+
+        safe_extra_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
+        # Force-disable FDA in safe mode for main_fda.py (beta=0 makes FDA a no-op)
+        if "fda" in args.train_script.lower():
+            safe_extra_tokens = _replace_or_add_flag(safe_extra_tokens, "--fda-beta", "0")
+
+        # Keep BN frozen and fogpass frozen throughout this short run
+        safe_cmd = _build_train_cmd(
+            train_script=args.train_script,
+            exp_name=f"{args.exp_name}_SAFE",
+            base_ckpt=args.base_ckpt,
+            gpu=args.gpu,
+            num_steps=safe_steps,
+            num_steps_stop=safe_stop,
+            backbone_lr_mult=safe_backbone_mult,
+            head_lr_mult=safe_head_mult,
+            lambda_cl=str(args.lambda_cl),
+            cl_warmup_steps=str(args.cl_warmup_steps),
+            cl_temp=str(args.cl_temp),
+            cl_head_lr=str(args.cl_head_lr),
+            freeze_fogpass_steps=str(max(2000, safe_steps)),
+            fpf_lr_mult=str(args.fpf_lr_mult),
+            save_pred_every_early=str(args.save_pred_every_early),
+            save_pred_early_until=str(args.save_pred_early_until),
+            amp=str(args.amp),
+            finetune=bool(args.finetune),
+            freeze_bn=True,
+            save_dir=str(args.save_dir),
+            extra_tokens=safe_extra_tokens,
+        )
+
+        run(safe_cmd, title=f"SAFE TRAIN {args.exp_name}_SAFE ({safe_steps} steps)")
+
+        # Evaluate final checkpoint for safe run
+        final_name = f"{args.exp_name}_SAFE{safe_stop}.pth"
+        final_paths = [str(Path(d) / final_name) for d in snapshot_dirs]
+        final_paths = [p for p in final_paths if os.path.exists(p)]
+        ckpt = final_paths[0] if final_paths else find_latest_ckpt(f"{args.exp_name}_SAFE", snapshot_dirs)
+        if not ckpt:
+            print(f"[SAFE-WARN] No checkpoint found for {args.exp_name}_SAFE")
+            return 1
+
+        safe_metrics = eval_ckpt(f"{args.exp_name}_SAFE_FINAL", ckpt, args.gpu)
+        row = {
+            "exp": "SAFE",
+            "FZ": safe_metrics.get("FZ"),
+            "FDD": safe_metrics.get("FDD"),
+            "FD": safe_metrics.get("FD"),
+            "Lindau": safe_metrics.get("Lindau"),
+            "dFZ": _delta(safe_metrics.get("FZ"), base_metrics.get("FZ")),
+            "dFDD": _delta(safe_metrics.get("FDD"), base_metrics.get("FDD")),
+            "dFD": _delta(safe_metrics.get("FD"), base_metrics.get("FD")),
+            "dLindau": _delta(safe_metrics.get("Lindau"), base_metrics.get("Lindau")),
+        }
+        print("\n" + "=" * 10 + " SAFE SUMMARY " + "=" * 10)
+        _print_results_table(
+            [
+                {
+                    "exp": "BASE",
+                    "FZ": base_metrics.get("FZ"),
+                    "FDD": base_metrics.get("FDD"),
+                    "FD": base_metrics.get("FD"),
+                    "Lindau": base_metrics.get("Lindau"),
+                    "dFZ": 0.0,
+                    "dFDD": 0.0,
+                    "dFD": 0.0,
+                    "dLindau": 0.0,
+                },
+                row,
+            ]
+        )
+        print("\nDone.")
+        return 0
 
     # Optional ablation sweep (recommended to diagnose 'why mIoU drops')
     if bool(getattr(args, "sweep", False)):
