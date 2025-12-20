@@ -186,6 +186,12 @@ def fetch_next(loader_iter, loader):
         loader_iter = iter(loader)
         return next(loader_iter), loader_iter
 
+
+def _set_batchnorm_eval(m: nn.Module):
+    # Freeze BN running_mean/var updates (common culprit for quick degradation when resuming with small batch).
+    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+        m.eval()
+
 def main():
     """Create the model and start the training."""
 
@@ -252,6 +258,10 @@ def main():
     if is_distributed:
         model = DDP(model, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
     model.train()
+
+    freeze_bn = bool(getattr(args, "freeze_bn", False)) or bool(getattr(args, "finetune", False))
+    if freeze_bn:
+        model.apply(_set_batchnorm_eval)
 
     lr_fpf1 = 1e-3
     lr_fpf2 = 1e-3
@@ -478,6 +488,8 @@ def main():
                 # freeze the parameters of fog pass filtering modules
 
                 model.train()
+                if freeze_bn:
+                    model.apply(_set_batchnorm_eval)
                 for param in model.parameters():
                     param.requires_grad = True
                 for param in FogPassFilter1.parameters():

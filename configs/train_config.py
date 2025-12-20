@@ -86,6 +86,9 @@ def get_arguments():
                         help="If >0, override snapshot interval for early steps")
     parser.add_argument("--save-pred-early-until", type=int, default=0,
                         help="If >0, apply --save-pred-every-early while i_iter < this step")
+
+    parser.add_argument("--freeze-bn", action="store_true",
+                        help="Freeze BatchNorm running stats (set BN layers to eval) during training; useful for resume/finetune with small batch")
     parser.add_argument("--file-name", type=str, required=True)
     parser.add_argument("--modeltrain", type=str, required=True)
     parser.add_argument("--distributed", action="store_true")
