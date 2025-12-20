@@ -130,6 +130,9 @@ def eval():
         output.save('%s/%s' % (save_dir_fz, name))
         output_col.save('%s/%s_color.png' % (save_dir_fz, name[:-4]))
     miou_fz = compute_mIoU(args.gt_dir_fz, save_dir_fz, args.devkit_dir_fz, 'FZ')
+    # Stable, parse-friendly summary (compute_mIoU also prints, but keep this consistent)
+    print('Evaluation on Foggy Zurich')
+    print('===> mIoU: ' + str(miou_fz))
 
     # Test on Foggy Driving Dense (if available)
     try:
@@ -176,6 +179,8 @@ def eval():
             output.save('%s/%s' % (save_dir_fdd, name))
             output_col.save('%s/%s_color.png' % (save_dir_fdd, name[:-4]))
         miou_fdd = compute_mIoU(args.gt_dir_fd, save_dir_fdd, args.devkit_dir_fd, 'FDD')
+        print('Evaluation on Foggy Driving Dense')
+        print('===> mIoU: ' + str(miou_fdd))
     except FileNotFoundError as e:
         print(f"Skipping Foggy Driving Dense evaluation (dataset not available): {e}")
         miou_fdd = 0
@@ -229,6 +234,8 @@ def eval():
             output.save('%s/%s' % (save_dir_fd, name))
             output_col.save('%s/%s_color.png' % (save_dir_fd, name[:-4]))
         miou_fd = compute_mIoU(args.gt_dir_fd, save_dir_fd, args.devkit_dir_fd, 'FD')
+        print('Evaluation on Foggy Driving')
+        print('===> mIoU: ' + str(miou_fd))
     except FileNotFoundError as e:
         print(f"Skipping Foggy Driving evaluation (dataset not available): {e}")
         miou_fd = 0
@@ -294,6 +301,8 @@ def eval():
             output_col.save('%s/%s_color.png' % (save_dir_clindau, name.split('.')[0]))
 
         miou_clindau = compute_mIoU(args.gt_dir_clindau, save_dir_clindau, args.devkit_dir_clindau, 'Clindau')
+        print('Evaluation on Cityscapes lindau')
+        print('===> mIoU: ' + str(miou_clindau))
     except FileNotFoundError as e:
         print(f"Skipping Clear Lindau evaluation (dataset not available): {e}")
         miou_clindau = 0

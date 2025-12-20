@@ -103,19 +103,17 @@ def inspect_checkpoint(path: str) -> dict:
 def eval_ckpt(tag: str, ckpt_path: str, gpu: str) -> dict:
     _, out = run_capture(["python", "evaluate.py", "--file-name", tag, "--restore-from", ckpt_path, "--gpu", str(gpu)], title=f"EVAL {tag}")
 
-    def grab(dataset_header: str) -> float | None:
-        idx = out.find(dataset_header)
-        if idx < 0:
-            return None
-        chunk = out[idx : idx + 800]
-        m = re.search(r"mIoU:\\s*([0-9]+(?:\\.[0-9]+)?)", chunk)
+    def grab(dataset_header_regex: str) -> float | None:
+        # Multiline, non-greedy search from header to the first mIoU value.
+        m = re.search(dataset_header_regex + r".*?mIoU:\\s*([0-9]+(?:\\.[0-9]+)?)", out, flags=re.IGNORECASE | re.DOTALL)
         return float(m.group(1)) if m else None
 
     return {
-        "FZ": grab("Evaluation on Foggy Zurich"),
-        "FDD": grab("Evaluation on Foggy Driving Dense"),
-        "FD": grab("Evaluation on Foggy Driving"),
-        "Lindau": grab("Evaluation on Cityscapes lindau"),
+        "FZ": grab(r"Evaluation\s+on\s+Foggy\s+Zurich"),
+        "FDD": grab(r"Evaluation\s+on\s+Foggy\s+Driving\s+Dense"),
+        "FD": grab(r"Evaluation\s+on\s+Foggy\s+Driving"),
+        # compute_iou.py prints: 'Evaluation on Cityscapes lindau 40'
+        "Lindau": grab(r"Evaluation\s+on\s+Cityscapes\s+lindau(?:\s+40)?"),
     }
 
 
