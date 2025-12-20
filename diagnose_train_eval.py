@@ -178,6 +178,62 @@ def find_latest_ckpt(exp_name: str, snapshot_dirs: list[str]) -> str | None:
     return str(matches[0])
 
 
+def _mean_delta(row: dict) -> float:
+    vals: list[float] = []
+    for k in ("dFZ", "dFDD", "dFD", "dLindau"):
+        v = row.get(k)
+        if isinstance(v, float):
+            vals.append(v)
+    return sum(vals) / len(vals) if vals else -1e9
+
+
+def _min_delta(row: dict) -> float:
+    vals: list[float] = []
+    for k in ("dFZ", "dFDD", "dFD", "dLindau"):
+        v = row.get(k)
+        if isinstance(v, float):
+            vals.append(v)
+    return min(vals) if vals else -1e9
+
+
+def _evaluate_many(
+    *,
+    tag_prefix: str,
+    exp_name_for_ckpt: str,
+    steps_to_eval: list[int],
+    snapshot_dirs: list[str],
+    final_stop: int,
+    gpu: str,
+    base_metrics: dict,
+) -> list[dict]:
+    rows: list[dict] = []
+    for st in steps_to_eval:
+        ckpt = find_ckpt_for_step(exp_name_for_ckpt, st, snapshot_dirs)
+        if not ckpt and st == final_stop:
+            final_name = f"{exp_name_for_ckpt}{final_stop}.pth"
+            final_paths = [str(Path(d) / final_name) for d in snapshot_dirs]
+            final_paths = [p for p in final_paths if os.path.exists(p)]
+            ckpt = final_paths[0] if final_paths else None
+        if not ckpt:
+            continue
+        m = eval_ckpt(f"{tag_prefix}@{st}", ckpt, gpu)
+        rows.append(
+            {
+                "exp": f"{tag_prefix}@{st}",
+                "ckpt": ckpt,
+                "FZ": m.get("FZ"),
+                "FDD": m.get("FDD"),
+                "FD": m.get("FD"),
+                "Lindau": m.get("Lindau"),
+                "dFZ": _delta(m.get("FZ"), base_metrics.get("FZ")),
+                "dFDD": _delta(m.get("FDD"), base_metrics.get("FDD")),
+                "dFD": _delta(m.get("FD"), base_metrics.get("FD")),
+                "dLindau": _delta(m.get("Lindau"), base_metrics.get("Lindau")),
+            }
+        )
+    return rows
+
+
 def inspect_checkpoint(path: str) -> dict:
     try:
         import torch
@@ -392,6 +448,12 @@ def main() -> int:
     ap.add_argument("--sweep-num-steps", type=int, default=10, help="Train steps per variant when --sweep is set")
     ap.add_argument("--sweep-num-steps-stop", type=int, default=10, help="Stop steps per variant when --sweep is set")
 
+    # Auto-improve: try a small set of recipes and pick best by --rank-mode
+    ap.add_argument("--auto-improve", action="store_true", help="Try ProtoCL + Boundary (+ tiny FDA) and pick best checkpoint by --rank-mode")
+    ap.add_argument("--auto-steps", type=int, default=200, help="Train steps per recipe in --auto-improve")
+    ap.add_argument("--auto-snapshot-every", type=int, default=20, help="Snapshot interval during --auto-improve")
+    ap.add_argument("--auto-include-fda", action="store_true", help="Also try tiny FDA betas in --auto-improve")
+
     args = ap.parse_args()
 
     repo = Path(args.repo_dir)
@@ -419,6 +481,223 @@ def main() -> int:
     print("\n[2] Baseline evaluation (before finetune):")
     base_metrics = eval_ckpt(f"{args.exp_name}_BASE", args.base_ckpt, args.gpu)
     print(base_metrics)
+
+    # Auto-improve mode: run a small set of conservative recipes and pick best by rank-mode.
+    if bool(getattr(args, "auto_improve", False)):
+        auto_steps = int(getattr(args, "auto_steps", 200))
+        auto_stop = auto_steps
+        every = int(getattr(args, "auto_snapshot_every", 20))
+        every = max(5, every)
+
+        # Use conservative LR to reduce risk of collapse; we rely on checkpoint selection.
+        auto_backbone_mult = "0.001"
+        auto_head_mult = "0.002"
+        auto_snapshot_until = str(auto_steps + 1)
+
+        # Keep BN frozen and keep FogPass frozen for these short runs.
+        base_common_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
+        common_kwargs = {
+            "gpu": args.gpu,
+            "num_steps": auto_steps,
+            "num_steps_stop": auto_stop,
+            "backbone_lr_mult": auto_backbone_mult,
+            "head_lr_mult": auto_head_mult,
+            "lambda_cl": str(args.lambda_cl),
+            "cl_warmup_steps": str(args.cl_warmup_steps),
+            "cl_temp": str(args.cl_temp),
+            "cl_head_lr": str(args.cl_head_lr),
+            "freeze_fogpass_steps": str(max(2000, auto_steps)),
+            "fpf_lr_mult": str(args.fpf_lr_mult),
+            "save_pred_every_early": str(every),
+            "save_pred_early_until": auto_snapshot_until,
+            "amp": str(args.amp),
+            "finetune": bool(args.finetune),
+            "freeze_bn": True,
+            "save_dir": str(args.save_dir),
+        }
+
+        # Define recipes (small and fairly safe). These are not guaranteed to improve,
+        # but the script will find the best checkpoint among them if any exists.
+        recipes: list[dict] = []
+
+        # ProtoCL: start gentle (lower proto-weight first)
+        recipes.append(
+            {
+                "name": "PROTO_w0.01",
+                "train_script": "main_proto_cl.py",
+                "extra_tokens": base_common_tokens
+                + [
+                    "--proto-weight",
+                    "0.01",
+                    "--proto-temp",
+                    "0.1",
+                    "--proto-momentum",
+                    "0.99",
+                    "--proto-init-iters",
+                    "80",
+                ],
+            }
+        )
+        recipes.append(
+            {
+                "name": "PROTO_w0.05",
+                "train_script": "main_proto_cl.py",
+                "extra_tokens": base_common_tokens
+                + [
+                    "--proto-weight",
+                    "0.05",
+                    "--proto-temp",
+                    "0.1",
+                    "--proto-momentum",
+                    "0.99",
+                    "--proto-init-iters",
+                    "80",
+                ],
+            }
+        )
+
+        # Boundary: use short warmup for short runs; low weight to avoid hurting fog sets.
+        recipes.append(
+            {
+                "name": "BND_w0.10",
+                "train_script": "main_boundary.py",
+                "extra_tokens": base_common_tokens
+                + [
+                    "--boundary-weight",
+                    "0.10",
+                    "--boundary-warmup-steps",
+                    str(min(80, max(20, auto_steps // 3))),
+                    "--boundary-lr",
+                    "0.0005",
+                ],
+            }
+        )
+        recipes.append(
+            {
+                "name": "BND_w0.25",
+                "train_script": "main_boundary.py",
+                "extra_tokens": base_common_tokens
+                + [
+                    "--boundary-weight",
+                    "0.25",
+                    "--boundary-warmup-steps",
+                    str(min(80, max(20, auto_steps // 3))),
+                    "--boundary-lr",
+                    "0.0005",
+                ],
+            }
+        )
+
+        # Optional: tiny FDA (based on your results, avoid large beta)
+        if bool(getattr(args, "auto_include_fda", False)):
+            for beta in ("0.0002", "0.0005"):
+                recipes.append(
+                    {
+                        "name": f"FDA_b{beta}",
+                        "train_script": "main_fda.py",
+                        "extra_tokens": _replace_or_add_flag(list(base_common_tokens), "--fda-beta", beta),
+                    }
+                )
+
+        # Determine steps to evaluate
+        steps_to_eval = list(range(every, auto_steps + 1, every))
+        if auto_steps not in steps_to_eval:
+            steps_to_eval.append(auto_steps)
+
+        all_rows: list[dict] = []
+        best = None
+        mode = str(getattr(args, "rank_mode", "fdd"))
+
+        for rec in recipes:
+            name = rec["name"]
+            train_script = rec["train_script"]
+            exp = f"{args.exp_name}_{name}"
+            cmd = _build_train_cmd(
+                train_script=train_script,
+                exp_name=exp,
+                base_ckpt=args.base_ckpt,
+                extra_tokens=list(rec["extra_tokens"]),
+                **common_kwargs,
+            )
+
+            run(cmd, title=f"AUTO TRAIN {exp} ({train_script})")
+
+            rows = _evaluate_many(
+                tag_prefix=name,
+                exp_name_for_ckpt=exp,
+                steps_to_eval=steps_to_eval,
+                snapshot_dirs=snapshot_dirs,
+                final_stop=auto_stop,
+                gpu=str(args.gpu),
+                base_metrics=base_metrics,
+            )
+
+            for r in rows:
+                # Add recipe label for easier tables
+                r["recipe"] = name
+                all_rows.append(r)
+                score = _rank_score(r, mode=mode)
+                if best is None or score > best[0]:
+                    best = (score, r)
+
+        print("\n" + "=" * 10 + " AUTO SUMMARY " + "=" * 10)
+        base_row = {
+            "exp": "BASE",
+            "FZ": base_metrics.get("FZ"),
+            "FDD": base_metrics.get("FDD"),
+            "FD": base_metrics.get("FD"),
+            "Lindau": base_metrics.get("Lindau"),
+            "dFZ": 0.0,
+            "dFDD": 0.0,
+            "dFD": 0.0,
+            "dLindau": 0.0,
+        }
+        # Print a compact table: exp (recipe@step) + metrics
+        rows_out = [base_row]
+        for r in all_rows:
+            rows_out.append(
+                {
+                    "exp": r.get("exp"),
+                    "FZ": r.get("FZ"),
+                    "FDD": r.get("FDD"),
+                    "FD": r.get("FD"),
+                    "Lindau": r.get("Lindau"),
+                    "dFZ": r.get("dFZ"),
+                    "dFDD": r.get("dFDD"),
+                    "dFD": r.get("dFD"),
+                    "dLindau": r.get("dLindau"),
+                }
+            )
+        _print_results_table(rows_out)
+
+        if best is None:
+            print("\n[AUTO] No checkpoints were evaluated (missing snapshots).")
+            return 0
+
+        b = best[1]
+        print(
+            f"\n[AUTO] Best by {mode}: {b.get('exp')}\n"
+            f"  ckpt: {b.get('ckpt')}\n"
+            f"  FZ={_fmt(b.get('FZ'))}  FDD={_fmt(b.get('FDD'))}  FD={_fmt(b.get('FD'))}  Lindau={_fmt(b.get('Lindau'))}\n"
+            f"  dFZ={_fmt(b.get('dFZ'))}  dFDD={_fmt(b.get('dFDD'))}  dFD={_fmt(b.get('dFD'))}  dLindau={_fmt(b.get('dLindau'))}"
+        )
+
+        # Honest status: did we actually improve under the chosen criterion?
+        if mode.lower() == "min":
+            improved = _min_delta(b) > 0
+        elif mode.lower() == "mean":
+            improved = _mean_delta(b) > 0
+        else:
+            improved = isinstance(b.get("dFDD"), float) and float(b.get("dFDD")) > 0
+
+        if improved:
+            print("\n[AUTO] Improvement found under selected criterion.")
+        else:
+            print("\n[AUTO] No improvement found under selected criterion in this search set.")
+            print("[AUTO] You can increase --auto-steps or enable --auto-include-fda to expand the search.")
+
+        print("\nDone.")
+        return 0
 
     # Safe short finetune (aim: no drop)
     if bool(getattr(args, "safe", False)):
