@@ -122,14 +122,20 @@ def upper_triangular_vector(square_matrix):
     return square_matrix[mask]
 
 def setup_optimisers_and_schedulers(args, model):
+    enc_lr = 6e-4
+    dec_lr = 6e-3
+    if bool(getattr(args, "finetune", False)):
+        enc_lr *= float(getattr(args, "backbone_lr_mult", 0.1))
+        dec_lr *= float(getattr(args, "head_lr_mult", 0.5))
+
     optimisers = get_optimisers(
         model=model,
         enc_optim_type="sgd",
-        enc_lr=6e-4,
+        enc_lr=enc_lr,
         enc_weight_decay=1e-5,
         enc_momentum=0.9,
         dec_optim_type="sgd",
-        dec_lr=6e-3,
+        dec_lr=dec_lr,
         dec_weight_decay=1e-5,
         dec_momentum=0.9,
     )
@@ -229,8 +235,11 @@ def main():
 
     start_iter = 0
     model = rf_lw101(num_classes=args.num_classes)
+    proj_head_ckpt = None
     if args.restore_from != RESTORE_FROM:
-        _, incompatible = load_model_checkpoint(model, args.restore_from, strict=True)
+        container, incompatible = load_model_checkpoint(model, args.restore_from, strict=True)
+        if isinstance(container, dict) and "proj_head_state_dict" in container:
+            proj_head_ckpt = container["proj_head_state_dict"]
         if is_main_process:
             if getattr(incompatible, "missing_keys", None) or getattr(incompatible, "unexpected_keys", None):
                 print("[Checkpoint] Loaded with key mismatch:")
@@ -285,6 +294,21 @@ def main():
 
     # Image-level contrastive learning between paired domains (SimCLR-style)
     contrastive_loss_fn = losses.NTXentLoss(temperature=float(getattr(args, "cl_temp", 0.1)))
+
+    class _ProjHead(nn.Module):
+        def __init__(self, in_dim: int, hidden_dim: int = 256, out_dim: int = 128):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, out_dim),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.net(x)
+
+    proj_head = None
+    proj_head_opt = None
 
     cudnn.benchmark = True
 
@@ -472,13 +496,38 @@ def main():
                         cw_features = {'layer0':feature_cw0, 'layer1':feature_cw1}
 
                     # Contrastive loss between SF and CW (paired by index)
-                    cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    base_cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    warmup_steps = int(getattr(args, "cl_warmup_steps", 0))
+                    if warmup_steps > 0:
+                        cl_lambda = base_cl_lambda * min(1.0, float(i_iter) / float(warmup_steps))
+                    else:
+                        cl_lambda = base_cl_lambda
+
                     if cl_lambda > 0:
-                        # Use a higher-level feature map for embeddings
                         emb_a = _global_pool_embedding(feature_sf4)
                         emb_b = _global_pool_embedding(feature_cw4)
-                        n = emb_a.size(0)
-                        emb = torch.cat([emb_a, emb_b], dim=0)
+
+                        if proj_head is None:
+                            proj_head = _ProjHead(emb_a.size(1)).to(device)
+                            if proj_head_ckpt is not None:
+                                try:
+                                    proj_head.load_state_dict(_strip_module_prefix(proj_head_ckpt), strict=False)
+                                except Exception as e:
+                                    if is_main_process:
+                                        print(f"[ProjHead] Could not load state_dict: {e}")
+                            if is_distributed:
+                                proj_head = DDP(proj_head, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
+                            proj_head_opt = torch.optim.AdamW(
+                                [p for p in proj_head.parameters() if p.requires_grad],
+                                lr=float(getattr(args, "cl_head_lr", 1e-3)),
+                                weight_decay=1e-4,
+                            )
+
+                        proj_head.train()
+                        z_a = F.normalize(proj_head(emb_a), p=2, dim=1, eps=1e-6)
+                        z_b = F.normalize(proj_head(emb_b), p=2, dim=1, eps=1e-6)
+                        n = z_a.size(0)
+                        emb = torch.cat([z_a, z_b], dim=0)
                         cl_labels = torch.arange(n, device=device, dtype=torch.long).repeat(2)
                         loss_cl = contrastive_loss_fn(emb, cl_labels)
                     else:
@@ -501,12 +550,38 @@ def main():
                         fsm_weights = {'layer0':0.5, 'layer1':0.5}
 
                     # Contrastive loss between SF and RF
-                    cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    base_cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    warmup_steps = int(getattr(args, "cl_warmup_steps", 0))
+                    if warmup_steps > 0:
+                        cl_lambda = base_cl_lambda * min(1.0, float(i_iter) / float(warmup_steps))
+                    else:
+                        cl_lambda = base_cl_lambda
+
                     if cl_lambda > 0:
                         emb_a = _global_pool_embedding(feature_sf4)
                         emb_b = _global_pool_embedding(feature_rf4)
-                        n = emb_a.size(0)
-                        emb = torch.cat([emb_a, emb_b], dim=0)
+
+                        if proj_head is None:
+                            proj_head = _ProjHead(emb_a.size(1)).to(device)
+                            if proj_head_ckpt is not None:
+                                try:
+                                    proj_head.load_state_dict(_strip_module_prefix(proj_head_ckpt), strict=False)
+                                except Exception as e:
+                                    if is_main_process:
+                                        print(f"[ProjHead] Could not load state_dict: {e}")
+                            if is_distributed:
+                                proj_head = DDP(proj_head, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
+                            proj_head_opt = torch.optim.AdamW(
+                                [p for p in proj_head.parameters() if p.requires_grad],
+                                lr=float(getattr(args, "cl_head_lr", 1e-3)),
+                                weight_decay=1e-4,
+                            )
+
+                        proj_head.train()
+                        z_a = F.normalize(proj_head(emb_a), p=2, dim=1, eps=1e-6)
+                        z_b = F.normalize(proj_head(emb_b), p=2, dim=1, eps=1e-6)
+                        n = z_a.size(0)
+                        emb = torch.cat([z_a, z_b], dim=0)
                         cl_labels = torch.arange(n, device=device, dtype=torch.long).repeat(2)
                         loss_cl = contrastive_loss_fn(emb, cl_labels)
                     else:
@@ -529,12 +604,38 @@ def main():
                         fsm_weights = {'layer0':0.5, 'layer1':0.5}
 
                     # Contrastive loss between CW and RF
-                    cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    base_cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                    warmup_steps = int(getattr(args, "cl_warmup_steps", 0))
+                    if warmup_steps > 0:
+                        cl_lambda = base_cl_lambda * min(1.0, float(i_iter) / float(warmup_steps))
+                    else:
+                        cl_lambda = base_cl_lambda
+
                     if cl_lambda > 0:
                         emb_a = _global_pool_embedding(feature_cw4)
                         emb_b = _global_pool_embedding(feature_rf4)
-                        n = emb_a.size(0)
-                        emb = torch.cat([emb_a, emb_b], dim=0)
+
+                        if proj_head is None:
+                            proj_head = _ProjHead(emb_a.size(1)).to(device)
+                            if proj_head_ckpt is not None:
+                                try:
+                                    proj_head.load_state_dict(_strip_module_prefix(proj_head_ckpt), strict=False)
+                                except Exception as e:
+                                    if is_main_process:
+                                        print(f"[ProjHead] Could not load state_dict: {e}")
+                            if is_distributed:
+                                proj_head = DDP(proj_head, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
+                            proj_head_opt = torch.optim.AdamW(
+                                [p for p in proj_head.parameters() if p.requires_grad],
+                                lr=float(getattr(args, "cl_head_lr", 1e-3)),
+                                weight_decay=1e-4,
+                            )
+
+                        proj_head.train()
+                        z_a = F.normalize(proj_head(emb_a), p=2, dim=1, eps=1e-6)
+                        z_b = F.normalize(proj_head(emb_b), p=2, dim=1, eps=1e-6)
+                        n = z_a.size(0)
+                        emb = torch.cat([z_a, z_b], dim=0)
                         cl_labels = torch.arange(n, device=device, dtype=torch.long).repeat(2)
                         loss_cl = contrastive_loss_fn(emb, cl_labels)
                     else:
@@ -588,7 +689,7 @@ def main():
 
                     loss_fsm += layer_fsm_loss / float(actual_batch_fsm)
 
-                cl_lambda = float(getattr(args, "lambda_cl", 0.0))
+                # cl_lambda is already warmup-adjusted above
                 loss = loss_seg_sf + loss_seg_cw + args.lambda_fsm*loss_fsm + args.lambda_con*loss_con + cl_lambda*loss_cl
                 loss = loss / args.iter_size
                 scaler_seg.scale(loss).backward()
@@ -615,6 +716,8 @@ def main():
 
                 for opt in opts:
                     scaler_seg.step(opt)
+                if proj_head_opt is not None:
+                    scaler_seg.step(proj_head_opt)
                 scaler_seg.update()
 
         if i_iter < 20000:
@@ -634,6 +737,7 @@ def main():
                 torch.save({'state_dict':get_state_dict(model),
                 'fogpass1_state_dict':get_state_dict(FogPassFilter1),
                 'fogpass2_state_dict':get_state_dict(FogPassFilter2),
+                'proj_head_state_dict': (get_state_dict(proj_head) if proj_head is not None else None),
                 'train_iter':i_iter,
                 'args':args
                 },osp.join(snapshot_dir, run_name)+'_fogpassfilter_'+str(i_iter)+'.pth')
@@ -649,6 +753,7 @@ def main():
                 'state_dict':get_state_dict(model),
                 'fogpass1_state_dict':get_state_dict(FogPassFilter1),
                 'fogpass2_state_dict':get_state_dict(FogPassFilter2),
+                'proj_head_state_dict': (get_state_dict(proj_head) if proj_head is not None else None),
                 'train_iter':i_iter,
                 'args':args
             },osp.join(snapshot_dir, run_name)+'_FIFO'+str(i_iter)+'.pth')

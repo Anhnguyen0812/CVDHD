@@ -48,7 +48,7 @@ def eval():
         model = rf_lw101(num_classes=args.num_classes)
 
     else:
-        restore = torch.load(args.restore_from)
+        restore = torch.load(args.restore_from, weights_only=False)
         model = rf_lw101(num_classes=args.num_classes)
 
         model.load_state_dict(restore['state_dict'])
@@ -120,140 +120,158 @@ def eval():
         output_col.save('%s/%s_color.png' % (save_dir_fz, name[:-4]))
     miou_fz = compute_mIoU(args.gt_dir_fz, save_dir_fz, args.devkit_dir_fz, 'FZ')
 
+    # Test on Foggy Driving Dense (if available)
+    try:
+        testloader1 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fdd, scale=1),
+                                        batch_size=1, shuffle=False, pin_memory=True)
 
-    testloader1 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fdd, scale=1),
-                                    batch_size=1, shuffle=False, pin_memory=True)
+        testloader2 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fdd, scale=0.8),
+                                        batch_size=1, shuffle=False, pin_memory=True) 
 
-    testloader2 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fdd, scale=0.8),
-                                    batch_size=1, shuffle=False, pin_memory=True) 
+        testloader3 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fdd, scale=0.6),
+                                        batch_size=1, shuffle=False, pin_memory=True)
+        testloader_iter2 = enumerate(testloader2)
+        testloader_iter3 = enumerate(testloader3)
 
-    testloader3 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fdd, scale=0.6),
-                                    batch_size=1, shuffle=False, pin_memory=True)
-    testloader_iter2 = enumerate(testloader2)
-    testloader_iter3 = enumerate(testloader3)
+        for index, batch in enumerate(testloader1):
+            image, size, name = batch
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                interp_eval = nn.Upsample(size=(size[0][0],size[0][1]), mode='bilinear')
+                output_1 = interp_eval(output2)
 
-    for index, batch in enumerate(testloader1):
-        image, size, name = batch
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            interp_eval = nn.Upsample(size=(size[0][0],size[0][1]), mode='bilinear')
-            output_1 = interp_eval(output2)
+            _, batch2 = testloader_iter2.__next__()
+            image, _, name = batch2
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                output_2 = interp_eval(output2)
 
-        _, batch2 = testloader_iter2.__next__()
-        image, _, name = batch2
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            output_2 = interp_eval(output2)
+            _, batch3 = testloader_iter3.__next__()    
+            image, _, name = batch3
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                output_3 = interp_eval(output2)
 
-        _, batch3 = testloader_iter3.__next__()    
-        image, _, name = batch3
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            output_3 = interp_eval(output2)
+            output = torch.cat([output_1,output_2,output_3])
+            output = torch.mean(output, dim=0)
+            output = output.cpu().numpy()
+            output = output.transpose(1,2,0)
+            output = np.asarray(np.argmax(output, axis=2), dtype=np.uint8)
 
-        output = torch.cat([output_1,output_2,output_3])
-        output = torch.mean(output, dim=0)
-        output = output.cpu().numpy()
-        output = output.transpose(1,2,0)
-        output = np.asarray(np.argmax(output, axis=2), dtype=np.uint8)
+            output_col = colorize_mask(output)
+            output = Image.fromarray(output)
 
-        output_col = colorize_mask(output)
-        output = Image.fromarray(output)
+            name = name[0].split('/')[-1]
+            output.save('%s/%s' % (save_dir_fdd, name))
+            output_col.save('%s/%s_color.png' % (save_dir_fdd, name[:-4]))
+        miou_fdd = compute_mIoU(args.gt_dir_fd, save_dir_fdd, args.devkit_dir_fd, 'FDD')
+    except FileNotFoundError as e:
+        print(f"Skipping Foggy Driving Dense evaluation (dataset not available): {e}")
+        miou_fdd = 0
+    except Exception as e:
+        print(f"Skipping Foggy Driving Dense evaluation (error): {e}")
+        miou_fdd = 0
 
-        name = name[0].split('/')[-1]
-        output.save('%s/%s' % (save_dir_fdd, name))
-        output_col.save('%s/%s_color.png' % (save_dir_fdd, name[:-4]))
-    miou_fdd = compute_mIoU(args.gt_dir_fd, save_dir_fdd, args.devkit_dir_fd, 'FDD')
+    # Test on Foggy Driving (if available)
+    try:
+        testloader1 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fd, scale=1),
+                                        batch_size=1, shuffle=False, pin_memory=True) 
 
+        testloader2 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fd, scale=0.8),
+                                        batch_size=1, shuffle=False, pin_memory=True) 
 
-    testloader1 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fd, scale=1),
-                                    batch_size=1, shuffle=False, pin_memory=True) 
+        testloader3 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fd, scale=0.6),
+                                        batch_size=1, shuffle=False, pin_memory=True) 
+        testloader_iter2 = enumerate(testloader2)
+        testloader_iter3 = enumerate(testloader3)
 
-    testloader2 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fd, scale=0.8),
-                                    batch_size=1, shuffle=False, pin_memory=True) 
+        for index, batch in enumerate(testloader1):
+            image, size, name = batch
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                interp_eval = nn.Upsample(size=(size[0][0],size[0][1]), mode='bilinear')
 
-    testloader3 = data.DataLoader(foggydrivingDataSet(args.data_dir_eval_fd, args.data_list_eval_fd, scale=0.6),
-                                    batch_size=1, shuffle=False, pin_memory=True) 
-    testloader_iter2 = enumerate(testloader2)
-    testloader_iter3 = enumerate(testloader3)
+                output_1 = interp_eval(output2)
 
-    for index, batch in enumerate(testloader1):
-        image, size, name = batch
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            interp_eval = nn.Upsample(size=(size[0][0],size[0][1]), mode='bilinear')
+            _, batch2 = testloader_iter2.__next__()
+            image, _, name = batch2
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                output_2 = interp_eval(output2)
 
-            output_1 = interp_eval(output2)
+            _, batch3 = testloader_iter3.__next__()    
+            image, _, name = batch3
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                output_3 = interp_eval(output2)
 
-        _, batch2 = testloader_iter2.__next__()
-        image, _, name = batch2
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            output_2 = interp_eval(output2)
+            output = torch.cat([output_1,output_2,output_3])
+            output = torch.mean(output, dim=0)
+            output = output.cpu().numpy()
+            output = output.transpose(1,2,0)
+            output = np.asarray(np.argmax(output, axis=2), dtype=np.uint8)
 
-        _, batch3 = testloader_iter3.__next__()    
-        image, _, name = batch3
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            output_3 = interp_eval(output2)
+            output_col = colorize_mask(output)
+            output = Image.fromarray(output)
 
-        output = torch.cat([output_1,output_2,output_3])
-        output = torch.mean(output, dim=0)
-        output = output.cpu().numpy()
-        output = output.transpose(1,2,0)
-        output = np.asarray(np.argmax(output, axis=2), dtype=np.uint8)
+            name = name[0].split('/')[-1]
+            output.save('%s/%s' % (save_dir_fd, name))
+            output_col.save('%s/%s_color.png' % (save_dir_fd, name[:-4]))
+        miou_fd = compute_mIoU(args.gt_dir_fd, save_dir_fd, args.devkit_dir_fd, 'FD')
+    except FileNotFoundError as e:
+        print(f"Skipping Foggy Driving evaluation (dataset not available): {e}")
+        miou_fd = 0
+    except Exception as e:
+        print(f"Skipping Foggy Driving evaluation (error): {e}")
+        miou_fd = 0
 
-        output_col = colorize_mask(output)
-        output = Image.fromarray(output)
+    # Test on Clear Lindau (if available)
+    try:
+        testloader1 = data.DataLoader(cityscapesDataSet(args.data_dir_city, args.data_city_list, crop_size = (2048, 1024), mean=IMG_MEAN, scale=False, mirror=False, set=args.set),
+                                batch_size=1, shuffle=False, pin_memory=True)
+        testloader2 = data.DataLoader(cityscapesDataSet(args.data_dir_city, args.data_city_list, crop_size = (2048*0.8, 1024*0.8), mean=IMG_MEAN, scale=False, mirror=False, set=args.set),
+                                batch_size=1, shuffle=False, pin_memory=True)
+        testloader3 = data.DataLoader(cityscapesDataSet(args.data_dir_city, args.data_city_list, crop_size = (2048*0.6, 1024*0.6), mean=IMG_MEAN, scale=False, mirror=False, set=args.set),
+                                batch_size=1, shuffle=False, pin_memory=True)   
+        testloader_iter2 = enumerate(testloader2)
+        testloader_iter3 = enumerate(testloader3)
 
-        name = name[0].split('/')[-1]
-        output.save('%s/%s' % (save_dir_fd, name))
-        output_col.save('%s/%s_color.png' % (save_dir_fd, name[:-4]))
-    miou_fd = compute_mIoU(args.gt_dir_fd, save_dir_fd, args.devkit_dir_fd, 'FD')
+        for index, batch in enumerate(testloader1):
+            image, size, name = batch
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                interp_eval = nn.Upsample(size=(1024, 2048), mode='bilinear')
+                output_1 = interp_eval(output2)
 
+            _, batch2 = testloader_iter2.__next__()
+            image, _, name = batch2
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                output_2 = interp_eval(output2)
 
-    testloader1 = data.DataLoader(cityscapesDataSet(args.data_dir_city, args.data_city_list, crop_size = (2048, 1024), mean=IMG_MEAN, scale=False, mirror=False, set=args.set),
-                            batch_size=1, shuffle=False, pin_memory=True)
-    testloader2 = data.DataLoader(cityscapesDataSet(args.data_dir_city, args.data_city_list, crop_size = (2048*0.8, 1024*0.8), mean=IMG_MEAN, scale=False, mirror=False, set=args.set),
-                            batch_size=1, shuffle=False, pin_memory=True)
-    testloader3 = data.DataLoader(cityscapesDataSet(args.data_dir_city, args.data_city_list, crop_size = (2048*0.6, 1024*0.6), mean=IMG_MEAN, scale=False, mirror=False, set=args.set),
-                            batch_size=1, shuffle=False, pin_memory=True)   
-    testloader_iter2 = enumerate(testloader2)
-    testloader_iter3 = enumerate(testloader3)
+            _, batch3 = testloader_iter3.__next__()    
+            image, _, name = batch3
+            with torch.no_grad():
+                output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
+                output_3 = interp_eval(output2)
 
-    for index, batch in enumerate(testloader1):
-        image, size, name = batch
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            interp_eval = nn.Upsample(size=(1024, 2048), mode='bilinear')
-            output_1 = interp_eval(output2)
+            output = torch.cat([output_1,output_2,output_3])
+            output = torch.mean(output, dim=0)
+            output = output.cpu().numpy()
+            output = output.transpose(1,2,0)
+            output = np.asarray(np.argmax(output, axis=2), dtype=np.uint8)
 
-        _, batch2 = testloader_iter2.__next__()
-        image, _, name = batch2
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            output_2 = interp_eval(output2)
+            output_col = colorize_mask(output)
+            output = Image.fromarray(output)
 
-        _, batch3 = testloader_iter3.__next__()    
-        image, _, name = batch3
-        with torch.no_grad():
-            output6, output3, output4, output5, output1, output2 = model(Variable(image).cuda(args.gpu))
-            output_3 = interp_eval(output2)
+            name = name[0].split('/')[-1]
+            output.save('%s/%s' % (save_dir_clindau, name))
+            output_col.save('%s/%s_color.png' % (save_dir_clindau, name.split('.')[0]))
 
-        output = torch.cat([output_1,output_2,output_3])
-        output = torch.mean(output, dim=0)
-        output = output.cpu().numpy()
-        output = output.transpose(1,2,0)
-        output = np.asarray(np.argmax(output, axis=2), dtype=np.uint8)
-
-        output_col = colorize_mask(output)
-        output = Image.fromarray(output)
-
-        name = name[0].split('/')[-1]
-        output.save('%s/%s' % (save_dir_clindau, name))
-        output_col.save('%s/%s_color.png' % (save_dir_clindau, name.split('.')[0]))
-
-    miou_clindau = compute_mIoU(args.gt_dir_clindau, save_dir_clindau, args.devkit_dir_clindau, 'Clindau')
+        miou_clindau = compute_mIoU(args.gt_dir_clindau, save_dir_clindau, args.devkit_dir_clindau, 'Clindau')
+    except FileNotFoundError:
+        print("Skipping Clear Lindau evaluation (dataset not available)")
+        miou_clindau = 0
 
 
 

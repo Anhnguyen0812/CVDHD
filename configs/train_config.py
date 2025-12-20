@@ -60,6 +60,16 @@ def get_arguments():
                         help="Weight for image-level contrastive loss (SimCLR/NT-Xent) between paired domains")
     parser.add_argument("--cl-temp", type=float, default=0.1,
                         help="Temperature for contrastive loss")
+    parser.add_argument("--cl-warmup-steps", type=int, default=1000,
+                        help="Linearly ramp contrastive loss weight over this many steps")
+    parser.add_argument("--finetune", action="store_true",
+                        help="Enable gentle-backbone / strong-new-head finetuning settings when resuming")
+    parser.add_argument("--backbone-lr-mult", type=float, default=0.1,
+                        help="Multiplier for encoder/backbone LR when --finetune is set")
+    parser.add_argument("--head-lr-mult", type=float, default=0.5,
+                        help="Multiplier for decoder/head LR when --finetune is set")
+    parser.add_argument("--cl-head-lr", type=float, default=1e-3,
+                        help="Learning rate for the contrastive projection head")
     parser.add_argument("--file-name", type=str, required=True)
     parser.add_argument("--modeltrain", type=str, required=True)
     parser.add_argument("--distributed", action="store_true")
