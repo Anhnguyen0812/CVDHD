@@ -667,12 +667,22 @@ def main():
                     scaler_seg.step(proj_head_opt)
                 scaler_seg.update()
 
-        if i_iter < 20000:
-            save_pred_every = 5000
-            if args.modeltrain=='train':
-                save_pred_every = 2000
+        # Snapshot scheduling
+        # Default behavior (original FIFO):
+        # - if i_iter < 20000: every 2000 (train) or 5000 (no-train)
+        # - else: args.save_pred_every
+        early_every = int(getattr(args, "save_pred_every_early", 0))
+        early_until = int(getattr(args, "save_pred_early_until", 0))
+
+        if early_every > 0 and early_until > 0 and i_iter < early_until:
+            save_pred_every = early_every
         else:
-            save_pred_every = args.save_pred_every
+            if i_iter < 20000:
+                save_pred_every = 5000
+                if args.modeltrain=='train':
+                    save_pred_every = 2000
+            else:
+                save_pred_every = args.save_pred_every
 
         if i_iter >= args.num_steps_stop - 1:
             if is_main_process:

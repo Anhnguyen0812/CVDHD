@@ -80,6 +80,12 @@ def get_arguments():
                         help="Override learning rate for FogPassFilter2 (Adamax). If not set, uses the built-in defaults")
     parser.add_argument("--fpf-lr-mult", type=float, default=1.0,
                         help="Multiplier applied to FogPassFilter lrs (useful when resuming/finetuning)")
+
+    # Snapshot frequency controls (useful for quick early-step debugging)
+    parser.add_argument("--save-pred-every-early", type=int, default=0,
+                        help="If >0, override snapshot interval for early steps")
+    parser.add_argument("--save-pred-early-until", type=int, default=0,
+                        help="If >0, apply --save-pred-every-early while i_iter < this step")
     parser.add_argument("--file-name", type=str, required=True)
     parser.add_argument("--modeltrain", type=str, required=True)
     parser.add_argument("--distributed", action="store_true")
