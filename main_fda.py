@@ -165,33 +165,37 @@ def fda_source_to_target(source: torch.Tensor, target: torch.Tensor, beta: float
     Swap low-frequency amplitude from target into source.
     Expects tensors in shape (N,C,H,W), float.
     """
-    if source.shape != target.shape:
-        # simplest: center-crop to common shape
-        h = min(source.shape[-2], target.shape[-2])
-        w = min(source.shape[-1], target.shape[-1])
-        source = source[..., :h, :w]
-        target = target[..., :h, :w]
-    src_fft = torch.fft.fftn(source.float(), dim=(-2, -1))
-    trg_fft = torch.fft.fftn(target.float(), dim=(-2, -1))
+    try:
+        if source.shape != target.shape:
+            # simplest: center-crop to common shape
+            h = min(source.shape[-2], target.shape[-2])
+            w = min(source.shape[-1], target.shape[-1])
+            source = source[..., :h, :w]
+            target = target[..., :h, :w]
+        src_fft = torch.fft.fftn(source.float(), dim=(-2, -1))
+        trg_fft = torch.fft.fftn(target.float(), dim=(-2, -1))
 
-    src_amp, src_phase = torch.abs(src_fft), torch.angle(src_fft)
-    trg_amp = torch.abs(trg_fft)
+        src_amp, src_phase = torch.abs(src_fft), torch.angle(src_fft)
+        trg_amp = torch.abs(trg_fft)
 
-    h, w = source.shape[-2], source.shape[-1]
-    b = int(min(h, w) * float(beta))
-    if b < 1:
+        h, w = source.shape[-2], source.shape[-1]
+        b = int(min(h, w) * float(beta))
+        if b < 1:
+            return source
+
+        src_amp = torch.fft.fftshift(src_amp, dim=(-2, -1))
+        trg_amp = torch.fft.fftshift(trg_amp, dim=(-2, -1))
+        c_h, c_w = h // 2, w // 2
+        src_amp[..., c_h - b : c_h + b + 1, c_w - b : c_w + b + 1] = trg_amp[
+            ..., c_h - b : c_h + b + 1, c_w - b : c_w + b + 1
+        ]
+        src_amp = torch.fft.ifftshift(src_amp, dim=(-2, -1))
+        mixed_fft = src_amp * torch.exp(1j * src_phase)
+        out = torch.fft.ifftn(mixed_fft, dim=(-2, -1)).real
+        return out.to(source.dtype)
+    except Exception as e:
+        print(f"[FDA] Error in FDA: {e}, falling back to original source")
         return source
-
-    src_amp = torch.fft.fftshift(src_amp, dim=(-2, -1))
-    trg_amp = torch.fft.fftshift(trg_amp, dim=(-2, -1))
-    c_h, c_w = h // 2, w // 2
-    src_amp[..., c_h - b : c_h + b + 1, c_w - b : c_w + b + 1] = trg_amp[
-        ..., c_h - b : c_h + b + 1, c_w - b : c_w + b + 1
-    ]
-    src_amp = torch.fft.ifftshift(src_amp, dim=(-2, -1))
-    mixed_fft = src_amp * torch.exp(1j * src_phase)
-    out = torch.fft.ifftn(mixed_fft, dim=(-2, -1)).real
-    return out.to(source.dtype)
 
 
 def main():
