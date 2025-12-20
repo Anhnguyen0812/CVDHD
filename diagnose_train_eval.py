@@ -155,7 +155,8 @@ def main() -> int:
 
     ap.add_argument("--num-steps", type=int, default=2100)
     ap.add_argument("--num-steps-stop", type=int, default=2100)
-    ap.add_argument("--steps", default="200,800,2000")
+    # Comma-separated list like: 200,800,2000. If provided with no value, means: no step eval.
+    ap.add_argument("--steps", nargs="?", const="", default="200,800,2000")
 
     ap.add_argument("--save-dir", default="")
     ap.add_argument("--snapshot-dir", default="./snapshots/FIFO_model")
