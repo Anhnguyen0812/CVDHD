@@ -103,22 +103,33 @@ def inspect_checkpoint(path: str) -> dict:
 def eval_ckpt(tag: str, ckpt_path: str, gpu: str) -> dict:
     _, out = run_capture(["python", "evaluate.py", "--file-name", tag, "--restore-from", ckpt_path, "--gpu", str(gpu)], title=f"EVAL {tag}")
 
-    def grab(dataset_header_regex: str) -> float | None:
-        # Multiline, non-greedy search from header to the first mIoU value.
-        m = re.search(dataset_header_regex + r".*?mIoU:\\s*([0-9]+(?:\\.[0-9]+)?)", out, flags=re.IGNORECASE | re.DOTALL)
-        return float(m.group(1)) if m else None
+    # Robust, line-based parse: find an "Evaluation on ..." header then the next "mIoU:".
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    miou_re = re.compile(r"mIoU:\s*([0-9]+(?:\.[0-9]+)?)", flags=re.IGNORECASE)
 
-    metrics = {
-        "FZ": grab(r"Evaluation\s+on\s+Foggy\s+Zurich"),
-        "FDD": grab(r"Evaluation\s+on\s+Foggy\s+Driving\s+Dense"),
-        "FD": grab(r"Evaluation\s+on\s+Foggy\s+Driving"),
-        # compute_iou.py prints: 'Evaluation on Cityscapes lindau 40'
-        "Lindau": grab(r"Evaluation\s+on\s+Cityscapes\s+lindau(?:\s+40)?"),
+    header_aliases: dict[str, list[re.Pattern]] = {
+        "FZ": [re.compile(r"^Evaluation\s+on\s+Foggy\s+Zurich\b", flags=re.IGNORECASE)],
+        "FDD": [re.compile(r"^Evaluation\s+on\s+Foggy\s+Driving\s+Dense\b", flags=re.IGNORECASE)],
+        "FD": [re.compile(r"^Evaluation\s+on\s+Foggy\s+Driving\b", flags=re.IGNORECASE)],
+        "Lindau": [
+            re.compile(r"^Evaluation\s+on\s+Cityscapes\s+lindau\b", flags=re.IGNORECASE),
+            re.compile(r"^Evaluation\s+on\s+Cityscapes\s+lindau\s+40\b", flags=re.IGNORECASE),
+        ],
     }
+
+    metrics: dict[str, float | None] = {"FZ": None, "FDD": None, "FD": None, "Lindau": None}
+    for i, line in enumerate(lines):
+        for key, patterns in header_aliases.items():
+            if any(p.search(line) for p in patterns):
+                # Search forward a few lines for the first mIoU value
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    m = miou_re.search(lines[j])
+                    if m:
+                        metrics[key] = float(m.group(1))
+                        break
 
     # If parsing failed, print a compact snippet to diagnose why (nan mIoU / all skipped / dataset missing).
     if all(v is None for v in metrics.values()):
-        lines = [ln for ln in out.splitlines() if ln.strip()]
         tail = "\n".join(lines[-60:])
         print("\n[PARSE-DEBUG] Could not find any mIoU lines in evaluate output.")
         # Common signals
