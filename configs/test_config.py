@@ -10,7 +10,7 @@ DATA_DIRECTORY_CITY = '/kaggle/input/fifo-dataset'
 DATA_LIST_PATH_EVAL = '/kaggle/input/fifo-dataset/foggy_zurich/Foggy_Zurich/lists_file_names/RGB_testv2_filenames.txt'
 DATA_LIST_PATH_EVAL_FD ='/kaggle/working/CVDHD/lists_file_names/leftImg8bit_testall_filenames.txt'
 DATA_LIST_PATH_EVAL_FDD ='/kaggle/working/CVDHD/lists_file_names/leftImg8bit_testdense_filenames.txt' 
-DATA_DIR_EVAL = '/kaggle/input/fifo-dataset'
+DATA_DIR_EVAL = '/kaggle/input/fifo-dataset/foggy_zurich'
 DATA_DIR_EVAL_FD = '/kaggle/input/foggy-driving/Foggy_Driving'
 NUM_CLASSES = 19 
 RESTORE_FROM = 'no model'
@@ -41,7 +41,7 @@ def get_arguments():
     parser.add_argument("--gt-dir-fz", type=str, default=GT_DIR_FZ)
     parser.add_argument("--gt-dir-fd", type=str, default=GT_DIR_FD)
     parser.add_argument("--gt-dir-clindau", type=str, default=GT_DIR_CLINDAU)
-    parser.add_argument("--devkit-dir-fz", default='/root/data1/Foggy_Zurich/lists_file_names') 
+    parser.add_argument("--devkit-dir-fz", default='/kaggle/input/fifo-dataset/foggy_zurich/Foggy_Zurich/lists_file_names') 
     parser.add_argument("--devkit-dir-fd", default='./lists_file_names') 
     parser.add_argument("--devkit-dir-clindau", default='./dataset/cityscapes_list')
     return parser.parse_args()
