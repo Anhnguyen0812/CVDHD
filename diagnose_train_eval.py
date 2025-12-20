@@ -68,6 +68,46 @@ def _delta(v: float | None, base: float | None) -> float | None:
     return v - base
 
 
+def _rank_score(row: dict, *, mode: str) -> tuple[float, float, float, float]:
+    """Return a sortable score tuple for a result row.
+
+    Higher is better. Uses deltas (dFZ/dFDD/dFD/dLindau) when present.
+
+    Modes:
+      - fdd: prioritize Foggy Driving Dense
+      - mean: prioritize mean improvement across datasets
+      - min: prioritize worst-case (minimum) improvement across datasets
+    """
+
+    deltas: list[float] = []
+    for k in ("dFZ", "dFDD", "dFD", "dLindau"):
+        v = row.get(k)
+        if isinstance(v, float):
+            deltas.append(v)
+
+    if not deltas:
+        mean_delta = -1e9
+        min_delta = -1e9
+    else:
+        mean_delta = sum(deltas) / len(deltas)
+        min_delta = min(deltas)
+
+    d_fdd = row.get("dFDD")
+    d_fz = row.get("dFZ")
+    d_fdd_v = float(d_fdd) if isinstance(d_fdd, float) else -1e9
+    d_fz_v = float(d_fz) if isinstance(d_fz, float) else -1e9
+
+    m = (mode or "fdd").strip().lower()
+    if m == "min":
+        # Best worst-case; break ties with mean and FDD.
+        return (min_delta, mean_delta, d_fdd_v, d_fz_v)
+    if m == "mean":
+        # Best average; break ties with min and FDD.
+        return (mean_delta, min_delta, d_fdd_v, d_fz_v)
+    # Default: fdd
+    return (d_fdd_v, d_fz_v, mean_delta, min_delta)
+
+
 def _print_results_table(rows: list[dict]) -> None:
     headers = [
         "exp",
@@ -333,6 +373,19 @@ def main() -> int:
     # Safe quick run: tries hard to avoid mIoU drop (good for debugging before long runs)
     ap.add_argument("--safe", action="store_true", help="Run a conservative short finetune and compare to baseline")
     ap.add_argument("--safe-steps", type=int, default=100, help="Train steps for --safe mode")
+    ap.add_argument(
+        "--safe-fda-beta",
+        default="",
+        help="Optional: if using main_fda.py in --safe mode, set this to keep FDA enabled (e.g. 0.005). Empty => force beta=0.",
+    )
+
+    # Ranking mode for picking the 'best' checkpoint/variant
+    ap.add_argument(
+        "--rank-mode",
+        default="fdd",
+        choices=["fdd", "mean", "min"],
+        help="How to select best checkpoint/variant: fdd (default), mean (balanced avg delta), min (balanced worst-case delta)",
+    )
 
     # Ablation sweep: runs several short finetunes and compares deltas vs baseline
     ap.add_argument("--sweep", action="store_true", help="Run a small ablation sweep after baseline eval")
@@ -382,9 +435,13 @@ def main() -> int:
         safe_snapshot_until = str(safe_steps + 1)
 
         safe_extra_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
-        # Force-disable FDA in safe mode for main_fda.py (beta=0 makes FDA a no-op)
+        # SAFE defaults to disabling FDA to minimize drift, unless the user explicitly requests a beta.
         if "fda" in args.train_script.lower():
-            safe_extra_tokens = _replace_or_add_flag(safe_extra_tokens, "--fda-beta", "0")
+            safe_beta = str(getattr(args, "safe_fda_beta", "") or "").strip()
+            if safe_beta:
+                safe_extra_tokens = _replace_or_add_flag(safe_extra_tokens, "--fda-beta", safe_beta)
+            else:
+                safe_extra_tokens = _replace_or_add_flag(safe_extra_tokens, "--fda-beta", "0")
 
         # Keep BN frozen and fogpass frozen throughout this short run
         safe_cmd = _build_train_cmd(
@@ -450,14 +507,10 @@ def main() -> int:
                 }
             )
 
-        # Choose best by FDD (primary), then FZ as tiebreak
+        # Choose best checkpoint according to rank-mode (fdd/mean/min)
         best = None
         for r in safe_rows:
-            fdd = r.get("FDD")
-            fz = r.get("FZ")
-            if fdd is None:
-                continue
-            score = (float(fdd), float(fz) if fz is not None else -1e9)
+            score = _rank_score(r, mode=str(getattr(args, "rank_mode", "fdd")))
             if best is None or score > best[0]:
                 best = (score, r)
         print("\n" + "=" * 10 + " SAFE SUMMARY " + "=" * 10)
@@ -475,7 +528,12 @@ def main() -> int:
         rows_out = [base_row] + safe_rows
         _print_results_table(rows_out)
         if best is not None:
-            print(f"\nBest SAFE checkpoint by FDD: {best[1]['exp']}  FDD={best[1]['FDD']:.2f}  dFDD={best[1]['dFDD']:.2f}")
+            b = best[1]
+            mode = str(getattr(args, "rank_mode", "fdd")).lower()
+            print(
+                f"\nBest SAFE checkpoint by {mode}: {b['exp']}  "
+                f"FZ={_fmt(b.get('FZ'))}  FDD={_fmt(b.get('FDD'))}  FD={_fmt(b.get('FD'))}  Lindau={_fmt(b.get('Lindau'))}"
+            )
         print("\nDone.")
         return 0
 
@@ -576,6 +634,21 @@ def main() -> int:
 
         print("\n" + "=" * 10 + " SWEEP SUMMARY " + "=" * 10)
         _print_results_table(rows)
+        # Report best sweep variant by the chosen rank-mode
+        best_v = None
+        for r in rows:
+            if r.get("exp") == "BASE":
+                continue
+            score = _rank_score(r, mode=str(getattr(args, "rank_mode", "fdd")))
+            if best_v is None or score > best_v[0]:
+                best_v = (score, r)
+        if best_v is not None:
+            b = best_v[1]
+            mode = str(getattr(args, "rank_mode", "fdd")).lower()
+            print(
+                f"\nBest SWEEP variant by {mode}: {b['exp']}  "
+                f"dFZ={_fmt(b.get('dFZ'))}  dFDD={_fmt(b.get('dFDD'))}  dFD={_fmt(b.get('dFD'))}  dLindau={_fmt(b.get('dLindau'))}"
+            )
         print("\nDone.")
         return 0
 

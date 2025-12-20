@@ -1,0 +1,150 @@
+# Kaggle quick commands (train + eval + balanced checkpoint selection)
+
+This repo includes a helper script `diagnose_train_eval.py` that:
+- evaluates a **baseline** checkpoint
+- runs a short finetune (SAFE) or an ablation sweep (SWEEP)
+- evaluates multiple checkpoints and prints deltas for: **FZ / FDD / FD / Lindau**
+- picks the **best checkpoint** using `--rank-mode`:
+  - `fdd` (default): prioritize Foggy Driving Dense
+  - `mean`: maximize average improvement across all datasets
+  - `min`: maximize worst-case improvement (most “even”)
+
+Below are Kaggle notebook cells you can copy/paste.
+
+---
+
+## 0) Set paths
+
+```bash
+%cd /kaggle/working/CVDHD
+
+# GPU index
+GPU=0
+
+# Base checkpoint (put your path here)
+BASE=/kaggle/working/FIFO_final_model.pth
+
+# Where checkpoints/snapshots should be saved
+SAVE_DIR=/kaggle/working/snapshots/FIFO_model
+mkdir -p $SAVE_DIR
+```
+
+---
+
+## 1) Baseline evaluation only
+
+```bash
+!python evaluate.py \
+  --file-name BASELINE \
+  --restore-from $BASE \
+  --gpu $GPU
+```
+
+---
+
+## 2) SAFE run (recommended first)
+
+SAFE mode is designed to avoid sudden drops and **evaluates multiple checkpoints** (SAFE@20/40/...) then prints the best.
+
+### 2.1 FDA script (balanced selection)
+
+- Even improvement (worst-case): `--rank-mode min`
+- Average improvement: `--rank-mode mean`
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --exp-name FDA \
+  --train-script main_fda.py \
+  --train-extra "--fda-beta 0.01" \
+  --save-dir $SAVE_DIR \
+  --safe --safe-steps 100 \
+  --rank-mode min
+```
+
+If you want SAFE mode to actually *use* FDA (instead of forcing beta=0), set `--safe-fda-beta`:
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --exp-name FDA \
+  --train-script main_fda.py \
+  --save-dir $SAVE_DIR \
+  --safe --safe-steps 200 \
+  --safe-fda-beta 0.005 \
+  --rank-mode min
+```
+
+### 2.2 ProtoCL script (balanced selection)
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --exp-name PROTO \
+  --train-script main_proto_cl.py \
+  --save-dir $SAVE_DIR \
+  --safe --safe-steps 100 \
+  --rank-mode min
+```
+
+### 2.3 Boundary script (balanced selection)
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --exp-name BOUND \
+  --train-script main_boundary.py \
+  --save-dir $SAVE_DIR \
+  --safe --safe-steps 100 \
+  --rank-mode min
+```
+
+---
+
+## 3) SWEEP run (find what hurts / helps quickly)
+
+This runs several short variants (10 steps by default) and prints deltas vs baseline.
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --exp-name FDA \
+  --train-script main_fda.py \
+  --train-extra "--fda-beta 0.01" \
+  --save-dir $SAVE_DIR \
+  --sweep --sweep-num-steps 10 --sweep-num-steps-stop 10 \
+  --rank-mode mean
+```
+
+---
+
+## 4) Regular run + evaluate specific FIFO steps
+
+Example: train to 2100 steps, save snapshots at 200/800/2000, then evaluate those steps.
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --exp-name FDA_long \
+  --train-script main_fda.py \
+  --train-extra "--fda-beta 0.01" \
+  --num-steps 2100 --num-steps-stop 2100 \
+  --steps 200,800,2000 \
+  --save-dir $SAVE_DIR
+```
+
+Notes:
+- If you see `Missing ckpt for step=...`, it usually means the training saved to a different folder.
+  Setting `--save-dir $SAVE_DIR` makes train + eval consistent.
