@@ -70,6 +70,16 @@ def get_arguments():
                         help="Multiplier for decoder/head LR when --finetune is set")
     parser.add_argument("--cl-head-lr", type=float, default=1e-3,
                         help="Learning rate for the contrastive projection head")
+
+    # Diagnostics / stability knobs for resume-finetune
+    parser.add_argument("--freeze-fogpass-steps", type=int, default=0,
+                        help="If >0, do not update FogPassFilter modules for the first N training steps")
+    parser.add_argument("--fpf1-lr", type=float, default=None,
+                        help="Override learning rate for FogPassFilter1 (Adamax). If not set, uses the built-in defaults")
+    parser.add_argument("--fpf2-lr", type=float, default=None,
+                        help="Override learning rate for FogPassFilter2 (Adamax). If not set, uses the built-in defaults")
+    parser.add_argument("--fpf-lr-mult", type=float, default=1.0,
+                        help="Multiplier applied to FogPassFilter lrs (useful when resuming/finetuning)")
     parser.add_argument("--file-name", type=str, required=True)
     parser.add_argument("--modeltrain", type=str, required=True)
     parser.add_argument("--distributed", action="store_true")
