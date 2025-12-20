@@ -36,6 +36,55 @@ IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32
 RESTORE_FROM = 'without_pretraining'
 RESTORE_FROM_fogpass = 'without_pretraining'
 
+
+def _strip_module_prefix(state_dict):
+    """Strip a leading 'module.' prefix that can appear in DDP-saved checkpoints."""
+    if not isinstance(state_dict, dict):
+        return state_dict
+    if not any(isinstance(k, str) and k.startswith("module.") for k in state_dict.keys()):
+        return state_dict
+    return {k[len("module.") :]: v for k, v in state_dict.items()}
+
+
+def _load_state_dict_from_checkpoint(obj):
+    """Accept either a raw state_dict checkpoint or a dict with a 'state_dict' key."""
+    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+        return obj["state_dict"], obj
+    if isinstance(obj, dict):
+        return obj, None
+    raise TypeError(f"Unsupported checkpoint type: {type(obj)}")
+
+
+def load_model_checkpoint(model, ckpt_path, *, strict=True):
+    ckpt_obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict, container = _load_state_dict_from_checkpoint(ckpt_obj)
+    state_dict = _strip_module_prefix(state_dict)
+    incompatible = model.load_state_dict(state_dict, strict=strict)
+    return container if container is not None else ckpt_obj, incompatible
+
+
+def load_fogpass_checkpoint(fpf1, fpf2, ckpt_path, *, strict=True):
+    ckpt_obj = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if not isinstance(ckpt_obj, dict):
+        raise TypeError("FogPass checkpoint must be a dict containing fogpass state dicts")
+    if "fogpass1_state_dict" in ckpt_obj and "fogpass2_state_dict" in ckpt_obj:
+        sd1 = _strip_module_prefix(ckpt_obj["fogpass1_state_dict"])
+        sd2 = _strip_module_prefix(ckpt_obj["fogpass2_state_dict"])
+    elif "state_dict" in ckpt_obj and isinstance(ckpt_obj["state_dict"], dict):
+        # Some checkpoints may wrap everything; try common keys.
+        raise KeyError(
+            "FogPass checkpoint is missing 'fogpass1_state_dict'/'fogpass2_state_dict'. "
+            "Please pass a FIFO checkpoint that includes these keys."
+        )
+    else:
+        raise KeyError(
+            "FogPass checkpoint is missing 'fogpass1_state_dict'/'fogpass2_state_dict'."
+        )
+
+    incompatible1 = fpf1.load_state_dict(sd1, strict=strict)
+    incompatible2 = fpf2.load_state_dict(sd2, strict=strict)
+    return ckpt_obj, incompatible1, incompatible2
+
 def loss_calc(pred, label, device):
     label = Variable(label.long()).to(device)
     criterion = CrossEntropy2d().to(device)
@@ -48,6 +97,21 @@ def gram_matrix(tensor):
     tensor = tensor.view(d, h*w)
     gram = torch.mm(tensor, tensor.t())
     return gram
+
+
+def upper_triangular_vector(square_matrix):
+    """Return the upper-triangular (including diagonal) entries as a 1D vector.
+
+    Important: builds the mask on the same device as the matrix to avoid
+    CPU/GPU indexing mismatches.
+    """
+    if square_matrix.dim() != 2 or square_matrix.size(0) != square_matrix.size(1):
+        raise ValueError(
+            f"Expected a square 2D matrix, got shape {tuple(square_matrix.shape)}"
+        )
+    n = square_matrix.size(0)
+    mask = torch.ones((n, n), device=square_matrix.device, dtype=torch.bool).triu()
+    return square_matrix[mask]
 
 def setup_optimisers_and_schedulers(args, model):
     optimisers = get_optimisers(
@@ -155,14 +219,17 @@ def main():
     gpu = local_rank
     snapshot_dir = args.save_dir if args.save_dir else args.snapshot_dir
 
-    if args.restore_from == RESTORE_FROM:
-        start_iter = 0
-        model = rf_lw101(num_classes=args.num_classes)
-    else:
-        restore = torch.load(args.restore_from, map_location='cpu', weights_only=False)
-        model = rf_lw101(num_classes=args.num_classes)
-        model.load_state_dict(restore['state_dict'])
-        start_iter = 0
+    start_iter = 0
+    model = rf_lw101(num_classes=args.num_classes)
+    if args.restore_from != RESTORE_FROM:
+        _, incompatible = load_model_checkpoint(model, args.restore_from, strict=True)
+        if is_main_process:
+            if getattr(incompatible, "missing_keys", None) or getattr(incompatible, "unexpected_keys", None):
+                print("[Checkpoint] Loaded with key mismatch:")
+                if incompatible.missing_keys:
+                    print(f"  missing_keys: {incompatible.missing_keys[:20]}{' ...' if len(incompatible.missing_keys) > 20 else ''}")
+                if incompatible.unexpected_keys:
+                    print(f"  unexpected_keys: {incompatible.unexpected_keys[:20]}{' ...' if len(incompatible.unexpected_keys) > 20 else ''}")
 
     model.to(device)
     if is_distributed:
@@ -183,9 +250,19 @@ def main():
     FogPassFilter2.to(device)
 
     if args.restore_from_fogpass != RESTORE_FROM_fogpass:
-        restore = torch.load(args.restore_from_fogpass, map_location='cpu', weights_only=False)
-        FogPassFilter1.load_state_dict(restore['fogpass1_state_dict'])
-        FogPassFilter2.load_state_dict(restore['fogpass2_state_dict'])
+        _, inc1, inc2 = load_fogpass_checkpoint(FogPassFilter1, FogPassFilter2, args.restore_from_fogpass, strict=True)
+        if is_main_process:
+            if (getattr(inc1, "missing_keys", None) or getattr(inc1, "unexpected_keys", None) or
+                    getattr(inc2, "missing_keys", None) or getattr(inc2, "unexpected_keys", None)):
+                print("[FogPass] Loaded with key mismatch (showing first 20 keys each):")
+                if inc1.missing_keys:
+                    print(f"  fpf1 missing_keys: {inc1.missing_keys[:20]}{' ...' if len(inc1.missing_keys) > 20 else ''}")
+                if inc1.unexpected_keys:
+                    print(f"  fpf1 unexpected_keys: {inc1.unexpected_keys[:20]}{' ...' if len(inc1.unexpected_keys) > 20 else ''}")
+                if inc2.missing_keys:
+                    print(f"  fpf2 missing_keys: {inc2.missing_keys[:20]}{' ...' if len(inc2.missing_keys) > 20 else ''}")
+                if inc2.unexpected_keys:
+                    print(f"  fpf2 unexpected_keys: {inc2.unexpected_keys[:20]}{' ...' if len(inc2.unexpected_keys) > 20 else ''}")
 
     if is_distributed:
         FogPassFilter1 = DDP(FogPassFilter1, device_ids=[gpu], output_device=gpu, find_unused_parameters=False)
@@ -316,9 +393,9 @@ def main():
                     cw_g = gram_matrix(cw_feature[batch_idx])
                     rf_g = gram_matrix(rf_feature[batch_idx])
 
-                    vec_sf = Variable(sf_g[torch.triu(torch.ones(sf_g.size(0), sf_g.size(1))) == 1], requires_grad=True)
-                    vec_cw = Variable(cw_g[torch.triu(torch.ones(cw_g.size(0), cw_g.size(1))) == 1], requires_grad=True)
-                    vec_rf = Variable(rf_g[torch.triu(torch.ones(rf_g.size(0), rf_g.size(1))) == 1], requires_grad=True)
+                    vec_sf = Variable(upper_triangular_vector(sf_g), requires_grad=True)
+                    vec_cw = Variable(upper_triangular_vector(cw_g), requires_grad=True)
+                    vec_rf = Variable(upper_triangular_vector(rf_g), requires_grad=True)
 
                     fog_factor_list.append(fogpassfilter(vec_sf).unsqueeze(0))
                     fog_factor_list.append(fogpassfilter(vec_cw).unsqueeze(0))
@@ -451,8 +528,8 @@ def main():
                         if i_iter % 3 == 1 or i_iter % 3 == 2:
                             a_gram = a_gram *(hb*wb)/(ha*wa)
 
-                        vector_b_gram = b_gram[torch.triu(torch.ones(b_gram.size()[0], b_gram.size()[1])).requires_grad_() == 1].requires_grad_()
-                        vector_a_gram = a_gram[torch.triu(torch.ones(a_gram.size()[0], a_gram.size()[1])).requires_grad_() == 1].requires_grad_()
+                        vector_b_gram = upper_triangular_vector(b_gram).requires_grad_()
+                        vector_a_gram = upper_triangular_vector(a_gram).requires_grad_()
 
                         fog_factor_b = fogpassfilter(vector_b_gram)
                         fog_factor_a = fogpassfilter(vector_a_gram)
