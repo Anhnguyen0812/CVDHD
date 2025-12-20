@@ -479,6 +479,12 @@ def main() -> int:
     ap.add_argument("--safe", action="store_true", help="Run a conservative short finetune and compare to baseline")
     ap.add_argument("--safe-steps", type=int, default=100, help="Train steps for --safe mode")
     ap.add_argument(
+        "--safe-batch-size",
+        type=int,
+        default=0,
+        help="Optional: override --batch-size during --safe. 0 => auto (Boundary defaults to 1 to avoid OOM).",
+    )
+    ap.add_argument(
         "--safe-fda-beta",
         default="",
         help="Optional: if using main_fda.py in --safe mode, set this to keep FDA enabled (e.g. 0.005). Empty => force beta=0.",
@@ -770,6 +776,16 @@ def main() -> int:
         safe_snapshot_until = str(safe_steps + 1)
 
         safe_extra_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
+
+        # Memory safety: Boundary variant is heavy at 2048x1024; default to batch-size=1 in SAFE.
+        # User can override via --safe-batch-size or by passing --batch-size in --train-extra.
+        safe_bs = int(getattr(args, "safe_batch_size", 0) or 0)
+        if safe_bs <= 0 and "boundary" in args.train_script.lower():
+            safe_bs = 1
+        if safe_bs > 0:
+            safe_extra_tokens = _replace_or_add_flag(safe_extra_tokens, "--batch-size", str(safe_bs))
+            # Also reduce loader workers a bit for stability on Kaggle
+            safe_extra_tokens = _replace_or_add_flag(safe_extra_tokens, "--num-workers", "2")
         # SAFE defaults to disabling FDA to minimize drift, unless the user explicitly requests a beta.
         if "fda" in args.train_script.lower():
             safe_beta = str(getattr(args, "safe_fda_beta", "") or "").strip()
