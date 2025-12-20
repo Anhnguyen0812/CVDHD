@@ -155,6 +155,49 @@ def _replace_or_add_flag(tokens: list[str], flag: str, value: str | None) -> lis
     return out
 
 
+def parse_base_metrics(s: str) -> dict[str, float] | None:
+    """Parse baseline metrics from a string.
+
+    Supported formats:
+      - "FZ=48.41,FDD=48.93,FD=50.71,Lindau=64.75"
+      - "48.41,48.93,50.71,64.75" (order: FZ,FDD,FD,Lindau)
+    """
+    if not s or not s.strip():
+        return None
+    raw = s.strip()
+
+    # Key=val form
+    if "=" in raw:
+        out: dict[str, float] = {}
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        for p in parts:
+            if "=" not in p:
+                continue
+            k, v = p.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if not k:
+                continue
+            out[k] = float(v)
+        # normalize allowed keys
+        key_map = {"fz": "FZ", "fdd": "FDD", "fd": "FD", "lindau": "Lindau"}
+        norm: dict[str, float] = {}
+        for k, v in out.items():
+            kk = key_map.get(k.strip().lower())
+            if kk:
+                norm[kk] = float(v)
+        if norm:
+            return norm
+        return None
+
+    # Positional form
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) != 4:
+        raise ValueError("--base-metrics must have 4 comma-separated values or key=value pairs")
+    vals = [float(x) for x in parts]
+    return {"FZ": vals[0], "FDD": vals[1], "FD": vals[2], "Lindau": vals[3]}
+
+
 def find_ckpt_for_step(exp_name: str, step: int, snapshot_dirs: list[str]) -> str | None:
     # training saves: <snapshot_dir>/<run_name>_FIFO{step}.pth, where run_name = "{file-name}-{MM-DD-HH-MM}"
     patterns = [str(Path(d) / f"*{exp_name}*FIFO{step}.pth") for d in snapshot_dirs]
@@ -393,6 +436,12 @@ def main() -> int:
     ap.add_argument("--train-script", default="main_fda.py")
     ap.add_argument("--exp-name", required=True)
 
+    ap.add_argument(
+        "--base-metrics",
+        default="",
+        help="Optional: skip baseline evaluation and use these metrics instead. Formats: 'FZ=48.41,FDD=48.93,FD=50.71,Lindau=64.75' or '48.41,48.93,50.71,64.75'",
+    )
+
     ap.add_argument("--num-steps", type=int, default=2100)
     ap.add_argument("--num-steps-stop", type=int, default=2100)
     # Comma-separated list like: 200,800,2000. If provided with no value, means: no step eval.
@@ -478,9 +527,16 @@ def main() -> int:
     base_info = inspect_checkpoint(args.base_ckpt)
     print(base_info)
 
-    print("\n[2] Baseline evaluation (before finetune):")
-    base_metrics = eval_ckpt(f"{args.exp_name}_BASE", args.base_ckpt, args.gpu)
-    print(base_metrics)
+    provided_base = parse_base_metrics(str(getattr(args, "base_metrics", "")))
+    if provided_base is not None:
+        base_metrics = {"FZ": None, "FDD": None, "FD": None, "Lindau": None}
+        base_metrics.update(provided_base)
+        print("\n[2] Baseline evaluation: skipped (using --base-metrics)")
+        print(base_metrics)
+    else:
+        print("\n[2] Baseline evaluation (before finetune):")
+        base_metrics = eval_ckpt(f"{args.exp_name}_BASE", args.base_ckpt, args.gpu)
+        print(base_metrics)
 
     # Auto-improve mode: run a small set of conservative recipes and pick best by rank-mode.
     if bool(getattr(args, "auto_improve", False)):

@@ -199,7 +199,8 @@ def init_prototypes_from_labeled_source(
             lab = label.to(device).long()
             with amp.autocast(enabled=False):
                 out1, out2, out3, out4, out5, out6 = teacher(img)
-                feat = out4.float()  # (N,C,h,w)
+                # Use the same feature level as training-time ProtoCL loss (out5 / feature_sf4)
+                feat = out5.float()  # (N,C,h,w)
 
             # downsample label to feat size
             lab_ds = F.interpolate(lab.unsqueeze(1).float(), size=feat.shape[-2:], mode="nearest").squeeze(1).long()
@@ -382,7 +383,8 @@ def main():
     sf0, _cw0, _lab0, *_rest0 = batch0
     with torch.no_grad():
         out1, out2, out3, out4, out5, out6 = teacher(sf0.to(device))
-    feat_dim = int(out4.shape[1])
+    # Must match feature tensor used in ProtoCL loss (feature_sf4 / out5)
+    feat_dim = int(out5.shape[1])
     proj_head = ProjectionHead(in_dim=feat_dim, hidden_dim=256, out_dim=128).to(device)
     proj_opt = torch.optim.AdamW(proj_head.parameters(), lr=proj_lr, weight_decay=1e-4)
 
@@ -525,7 +527,8 @@ def main():
                         cw_features = {"layer0": feature_cw0, "layer1": feature_cw1}
 
                     # Pixel-to-prototype loss (use SF features at out4 resolution)
-                    feat = feature_sf4.float()  # (N,1024,h,w)
+                    # Pixel-to-prototype loss (use SF features at out5 resolution)
+                    feat = feature_sf4.float()  # (N,C,h,w)
                     n, c, h, w = feat.shape
                     lab = label.to(device).long()
                     lab_ds = F.interpolate(lab.unsqueeze(1).float(), size=(h, w), mode="nearest").squeeze(1).long()
