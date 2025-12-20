@@ -491,8 +491,6 @@ def main():
                     bnd_logits_up = F.interpolate(bnd_logits, size=edge_target.shape[-2:], mode="bilinear", align_corners=False)
                     loss_bnd = bce(bnd_logits_up, edge_target)
 
-                scaler_bnd.scale(loss_bnd / float(args.iter_size)).backward()
-
                 # Segmentation (only after warmup)
                 if i_iter >= boundary_warmup_steps:
                     if i_iter % 3 == 0:
@@ -577,22 +575,20 @@ def main():
                         loss_fsm = loss_fsm + (layer_fsm_loss / float(actual_batch_fsm))
 
                     seg_loss = loss_seg_sf + loss_seg_cw + args.lambda_fsm * loss_fsm + args.lambda_con * loss_con
-                    total_loss = seg_loss + boundary_weight * loss_bnd
-                    total_loss = total_loss / float(args.iter_size)
+                    total_loss = (seg_loss + boundary_weight * loss_bnd) / float(args.iter_size)
                     scaler_seg.scale(total_loss).backward()
                 else:
                     # warm-up: only boundary
-                    total_loss = boundary_weight * loss_bnd / float(args.iter_size)
+                    total_loss = (boundary_weight * loss_bnd) / float(args.iter_size)
+                    scaler_seg.scale(total_loss).backward()
 
                 # step
+                if boundary_opt is not None:
+                    scaler_seg.step(boundary_opt)
                 if i_iter >= boundary_warmup_steps:
                     for opt in opts:
                         scaler_seg.step(opt)
-                    scaler_seg.update()
-
-                if boundary_opt is not None:
-                    scaler_bnd.step(boundary_opt)
-                    scaler_bnd.update()
+                scaler_seg.update()
 
                 if is_main_process:
                     p, r, f1 = boundary_fscore(bnd_logits_up.detach(), edge_target)

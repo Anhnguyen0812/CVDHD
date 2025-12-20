@@ -43,6 +43,13 @@ def eval():
     """Create the model and start the evaluation process."""
     args = get_arguments()
 
+    def _strip_module_prefix(state_dict):
+        if not isinstance(state_dict, dict):
+            return state_dict
+        if not any(isinstance(k, str) and k.startswith("module.") for k in state_dict.keys()):
+            return state_dict
+        return {k[len("module.") :]: v for k, v in state_dict.items()}
+
     if args.restore_from == RESTORE_FROM:
         start_iter = 0
         model = rf_lw101(num_classes=args.num_classes)
@@ -50,8 +57,12 @@ def eval():
     else:
         restore = torch.load(args.restore_from, weights_only=False)
         model = rf_lw101(num_classes=args.num_classes)
-
-        model.load_state_dict(restore['state_dict'])
+        # Support both formats:
+        #  1) {'state_dict': ... , ...}
+        #  2) raw state_dict (tensor dict)
+        state_dict = restore["state_dict"] if isinstance(restore, dict) and "state_dict" in restore else restore
+        state_dict = _strip_module_prefix(state_dict)
+        model.load_state_dict(state_dict, strict=True)
         start_iter = 0
 
     save_dir_fz = osp.join(f'./result_FZ', args.file_name)

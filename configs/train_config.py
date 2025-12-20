@@ -22,8 +22,10 @@ RANDOM_SEED = 1234
 RESTORE_FROM = 'no_model'
 RESTORE_FROM_fogpass = 'no_model'
 SAVE_PRED_EVERY = 100
-SNAPSHOT_DIR = f'./snapshots/FIFO_model'   
-SAVE_DIR = '/kaggle/working/snapshots/FIFO_model'
+SNAPSHOT_DIR = f'./snapshots/FIFO_model'
+# If set, this overrides --snapshot-dir in the training entrypoints.
+# Default to empty to avoid hard-coding Kaggle-only paths.
+SAVE_DIR = ''
 
 SET = 'train'
 

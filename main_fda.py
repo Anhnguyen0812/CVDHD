@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import wandb
+import glob
 from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils import data
@@ -237,10 +238,35 @@ def main():
     if is_main_process and not os.path.exists(snapshot_dir):
         os.makedirs(snapshot_dir)
 
+    def _find_checkpoint(path_or_tag, snapshot_dir):
+        if path_or_tag is None:
+            return None
+        if str(path_or_tag).lower() in ("no_model", "without_pretraining", "none", ""):
+            return None
+        if str(path_or_tag).lower() in ("latest", "last"):
+            candidates = glob.glob(os.path.join(snapshot_dir, "*.pth"))
+            return max(candidates, key=os.path.getmtime) if candidates else None
+        if str(path_or_tag).lower() == "best":
+            candidates = glob.glob(os.path.join(snapshot_dir, "**/*best*.pth"), recursive=True)
+            if candidates:
+                return candidates[0]
+            candidates = glob.glob(os.path.join(snapshot_dir, "*.pth"))
+            return max(candidates, key=os.path.getmtime) if candidates else None
+        return path_or_tag if os.path.exists(path_or_tag) else None
+
     # Model
     model = rf_lw101(num_classes=args.num_classes)
-    if args.restore_from != RESTORE_FROM:
-        load_model_checkpoint(model, args.restore_from, strict=True)
+    ckpt_path = _find_checkpoint(args.restore_from, snapshot_dir)
+    if ckpt_path:
+        try:
+            load_model_checkpoint(model, ckpt_path, strict=True)
+            if is_main_process:
+                print(f"[Restore] Loaded model weights from: {ckpt_path}")
+        except Exception as e:
+            print(f"[Restore] Failed loading model from {ckpt_path}: {e}")
+    else:
+        if str(args.restore_from).lower() not in ("no_model", "without_pretraining", "none", ""):
+            print(f"[Restore] requested checkpoint '{args.restore_from}' not found in '{snapshot_dir}', skipping model load")
     model.to(device)
     if is_distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
@@ -266,8 +292,17 @@ def main():
     FogPassFilter1_optimizer = torch.optim.Adamax([p for p in FogPassFilter1.parameters() if p.requires_grad], lr=lr_fpf1)
     FogPassFilter2_optimizer = torch.optim.Adamax([p for p in FogPassFilter2.parameters() if p.requires_grad], lr=lr_fpf2)
 
-    if args.restore_from_fogpass != RESTORE_FROM_fogpass:
-        load_fogpass_checkpoint(FogPassFilter1, FogPassFilter2, args.restore_from_fogpass, strict=True)
+    ckpt_fp = _find_checkpoint(args.restore_from_fogpass, snapshot_dir)
+    if ckpt_fp:
+        try:
+            load_fogpass_checkpoint(FogPassFilter1, FogPassFilter2, ckpt_fp, strict=True)
+            if is_main_process:
+                print(f"[Restore] Loaded fogpass weights from: {ckpt_fp}")
+        except Exception as e:
+            print(f"[Restore] Failed loading fogpass from {ckpt_fp}: {e}")
+    else:
+        if str(args.restore_from_fogpass).lower() not in ("no_model", "without_pretraining", "none", ""):
+            print(f"[Restore] requested fogpass checkpoint '{args.restore_from_fogpass}' not found in '{snapshot_dir}', skipping fogpass load")
 
     if is_distributed:
         FogPassFilter1 = DDP(FogPassFilter1, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
@@ -562,7 +597,17 @@ def main():
 
         if i_iter >= args.num_steps_stop - 1:
             if is_main_process:
-                torch.save(get_state_dict(model), osp.join(snapshot_dir, args.file_name + str(args.num_steps_stop) + ".pth"))
+                torch.save(
+                    {
+                        "state_dict": get_state_dict(model),
+                        "fogpass1_state_dict": get_state_dict(FogPassFilter1),
+                        "fogpass2_state_dict": get_state_dict(FogPassFilter2),
+                        "train_iter": i_iter,
+                        "args": args,
+                        "fda_beta": fda_beta,
+                    },
+                    osp.join(snapshot_dir, args.file_name + str(args.num_steps_stop) + ".pth"),
+                )
             break
 
         if is_main_process and i_iter % save_pred_every == 0 and i_iter != 0:
