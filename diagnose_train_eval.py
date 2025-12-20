@@ -108,13 +108,39 @@ def eval_ckpt(tag: str, ckpt_path: str, gpu: str) -> dict:
         m = re.search(dataset_header_regex + r".*?mIoU:\\s*([0-9]+(?:\\.[0-9]+)?)", out, flags=re.IGNORECASE | re.DOTALL)
         return float(m.group(1)) if m else None
 
-    return {
+    metrics = {
         "FZ": grab(r"Evaluation\s+on\s+Foggy\s+Zurich"),
         "FDD": grab(r"Evaluation\s+on\s+Foggy\s+Driving\s+Dense"),
         "FD": grab(r"Evaluation\s+on\s+Foggy\s+Driving"),
         # compute_iou.py prints: 'Evaluation on Cityscapes lindau 40'
         "Lindau": grab(r"Evaluation\s+on\s+Cityscapes\s+lindau(?:\s+40)?"),
     }
+
+    # If parsing failed, print a compact snippet to diagnose why (nan mIoU / all skipped / dataset missing).
+    if all(v is None for v in metrics.values()):
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        tail = "\n".join(lines[-60:])
+        print("\n[PARSE-DEBUG] Could not find any mIoU lines in evaluate output.")
+        # Common signals
+        skip_lines = [ln for ln in lines if ln.lower().startswith("skipping:")]
+        if skip_lines:
+            print(f"[PARSE-DEBUG] Found {len(skip_lines)} 'Skipping:' lines (likely GT/pred size mismatch for all images).")
+            print("[PARSE-DEBUG] Example:")
+            print(skip_lines[0])
+        missing_lines = [ln for ln in lines if "dataset not available" in ln.lower() or "missing" in ln.lower()]
+        if missing_lines:
+            print("[PARSE-DEBUG] Dataset/missing-file messages detected.")
+            print("[PARSE-DEBUG] Example:")
+            print(missing_lines[0])
+        miou_lines = [ln for ln in lines if "miou" in ln.lower()]
+        if miou_lines:
+            print("[PARSE-DEBUG] Lines containing 'mIoU' exist but may be 'nan' or unexpected format.")
+            print("[PARSE-DEBUG] Example:")
+            print(miou_lines[0])
+        print("\n[PARSE-DEBUG] Evaluate output tail (last ~60 lines):")
+        print(tail)
+
+    return metrics
 
 
 def main() -> int:
