@@ -369,43 +369,43 @@ def main():
 
                 total_fpf_loss = 0
                 for idx, layer in enumerate(fsm_weights):
-                cw_feature = cw_features[layer]
-                sf_feature = sf_features[layer]
-                rf_feature = rf_features[layer]
+                    cw_feature = cw_features[layer]
+                    sf_feature = sf_features[layer]
+                    rf_feature = rf_features[layer]
 
-                fogpassfilter = FogPassFilter1 if idx == 0 else FogPassFilter2
-                fogpassfilter_optimizer = FogPassFilter1_optimizer if idx == 0 else FogPassFilter2_optimizer
-                fogpassfilter.train()
-                fogpassfilter_optimizer.zero_grad(set_to_none=True)
+                    fogpassfilter = FogPassFilter1 if idx == 0 else FogPassFilter2
+                    fogpassfilter_optimizer = FogPassFilter1_optimizer if idx == 0 else FogPassFilter2_optimizer
+                    fogpassfilter.train()
+                    fogpassfilter_optimizer.zero_grad(set_to_none=True)
 
-                actual_batch = sf_feature.size(0)
-                fog_factor_list = []
-                fog_factor_labels_list = []
-                for batch_idx in range(actual_batch):
-                    sf_g = gram_matrix(sf_feature[batch_idx])
-                    cw_g = gram_matrix(cw_feature[batch_idx])
-                    rf_g = gram_matrix(rf_feature[batch_idx])
+                    actual_batch = sf_feature.size(0)
+                    fog_factor_list = []
+                    fog_factor_labels_list = []
+                    for batch_idx in range(actual_batch):
+                        sf_g = gram_matrix(sf_feature[batch_idx])
+                        cw_g = gram_matrix(cw_feature[batch_idx])
+                        rf_g = gram_matrix(rf_feature[batch_idx])
 
-                    vec_sf = upper_triangular_vector(sf_g).requires_grad_()
-                    vec_cw = upper_triangular_vector(cw_g).requires_grad_()
-                    vec_rf = upper_triangular_vector(rf_g).requires_grad_()
+                        vec_sf = upper_triangular_vector(sf_g).requires_grad_()
+                        vec_cw = upper_triangular_vector(cw_g).requires_grad_()
+                        vec_rf = upper_triangular_vector(rf_g).requires_grad_()
 
-                    fog_factor_list.append(fogpassfilter(vec_sf).unsqueeze(0))
-                    fog_factor_list.append(fogpassfilter(vec_cw).unsqueeze(0))
-                    fog_factor_list.append(fogpassfilter(vec_rf).unsqueeze(0))
-                    fog_factor_labels_list.extend([0, 1, 2])
+                        fog_factor_list.append(fogpassfilter(vec_sf).unsqueeze(0))
+                        fog_factor_list.append(fogpassfilter(vec_cw).unsqueeze(0))
+                        fog_factor_list.append(fogpassfilter(vec_rf).unsqueeze(0))
+                        fog_factor_labels_list.extend([0, 1, 2])
 
-                fog_factor_embeddings = torch.cat(fog_factor_list, dim=0)
-                fog_factor_embeddings = fog_factor_embeddings / torch.norm(fog_factor_embeddings, p=2, dim=1).unsqueeze(1).clamp(
-                    min=1e-6
-                )
-                fog_factor_labels = torch.LongTensor(fog_factor_labels_list).to(device)
-                fog_pass_filter_loss = fogpassfilter_loss(fog_factor_embeddings, fog_factor_labels)
-                total_fpf_loss = total_fpf_loss + fog_pass_filter_loss
+                    fog_factor_embeddings = torch.cat(fog_factor_list, dim=0)
+                    fog_factor_embeddings = fog_factor_embeddings / torch.norm(fog_factor_embeddings, p=2, dim=1).unsqueeze(1).clamp(
+                        min=1e-6
+                    )
+                    fog_factor_labels = torch.LongTensor(fog_factor_labels_list).to(device)
+                    fog_pass_filter_loss = fogpassfilter_loss(fog_factor_embeddings, fog_factor_labels)
+                    total_fpf_loss = total_fpf_loss + fog_pass_filter_loss
 
-                if is_main_process:
-                    wandb.log({f"layer{idx}/fpf loss": fog_pass_filter_loss}, step=i_iter)
-                    wandb.log({f"layer{idx}/total fpf loss": total_fpf_loss}, step=i_iter)
+                    if is_main_process:
+                        wandb.log({f"layer{idx}/fpf loss": fog_pass_filter_loss}, step=i_iter)
+                        wandb.log({f"layer{idx}/total fpf loss": total_fpf_loss}, step=i_iter)
 
                 scaler_fpf.scale(total_fpf_loss).backward()
                 scaler_fpf.step(FogPassFilter1_optimizer)
