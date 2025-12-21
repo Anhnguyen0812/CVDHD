@@ -283,6 +283,16 @@ def main():
 
     ema_decay = float(getattr(args, "ema_decay", 0.99))
     pseudo_thr = float(getattr(args, "pseudo_threshold", 0.95))
+    pseudo_thr_start = float(getattr(args, "pseudo_threshold_start", -1.0))
+    pseudo_thr_end = float(getattr(args, "pseudo_threshold_end", -1.0))
+    pseudo_thr_ramp = int(getattr(args, "pseudo_threshold_ramp", 0) or 0)
+    use_thr_schedule = pseudo_thr_ramp > 0 and pseudo_thr_start > 0.0 and pseudo_thr_end > 0.0
+
+    cons_w = float(getattr(args, "consistency_weight", 0.0) or 0.0)
+    cons_type = str(getattr(args, "consistency_type", "kl") or "kl").strip().lower()
+    cons_temp = float(getattr(args, "consistency_temp", 1.0) or 1.0)
+    if cons_temp <= 0:
+        cons_temp = 1.0
     strong_brightness = float(getattr(args, "strong_brightness", 0.2))
     strong_contrast = float(getattr(args, "strong_contrast", 0.2))
     strong_saturation = float(getattr(args, "strong_saturation", 0.2))
@@ -320,6 +330,14 @@ def main():
         sum_src = 0.0
         sum_tgt = 0.0
         apply_pseudo = (i_iter % pseudo_every) == 0
+
+        if use_thr_schedule:
+            t = float(i_iter) / float(max(1, pseudo_thr_ramp))
+            t = 1.0 if t > 1.0 else (0.0 if t < 0.0 else t)
+            current_thr = float(pseudo_thr_start) + (float(pseudo_thr_end) - float(pseudo_thr_start)) * t
+        else:
+            current_thr = float(pseudo_thr)
+
         for _sub_i in range(accum_steps):
             # Source labeled batch
             (sf_img, cw_img, src_lbl, size, _sf_name, _cw_name), src_iter = fetch_next(src_iter, src_loader)
@@ -365,10 +383,30 @@ def main():
                         probs = torch.softmax(t_logits.detach(), dim=1)
                         conf, pseudo = torch.max(probs, dim=1)
                         pseudo = pseudo.long()
-                        pseudo = pseudo.masked_fill(conf < float(pseudo_thr), 255)
+                        mask = conf >= float(current_thr)
+                        pseudo = pseudo.masked_fill(~mask, 255)
 
                         loss_tgt = loss_calc(s_logits, pseudo, device)
-                        loss = loss_src + (pseudo_w * loss_tgt)
+
+                        loss_cons = torch.tensor(0.0, device=device)
+                        if cons_w > 0.0:
+                            # Teacher-student consistency on probabilities (masked by confidence).
+                            # This is complementary to hard pseudo-label CE.
+                            pt = torch.softmax(t_logits.detach() / float(cons_temp), dim=1)
+                            if cons_type == "mse":
+                                ps = torch.softmax(s_logits / float(cons_temp), dim=1)
+                                per_pix = (ps - pt).pow(2).mean(dim=1)
+                            else:
+                                log_ps = torch.log_softmax(s_logits / float(cons_temp), dim=1)
+                                kl = F.kl_div(log_ps, pt, reduction="none")
+                                per_pix = kl.sum(dim=1)
+                            m = mask.to(dtype=per_pix.dtype)
+                            denom = m.sum().clamp(min=1.0)
+                            loss_cons = (per_pix * m).sum() / denom
+                            # Standard distillation scaling
+                            loss_cons = loss_cons * (float(cons_temp) ** 2)
+
+                        loss = loss_src + (pseudo_w * loss_tgt) + (cons_w * loss_cons)
                     else:
                         interp_tgt = nn.Upsample(size=(int(tgt_size[0][0]), int(tgt_size[0][1])), mode="bilinear", align_corners=True)
                         _out6, _out3, _out4, _out5, _out1, out2 = model(tgt_img.to(device))
@@ -405,6 +443,8 @@ def main():
                     "pw": f"{pseudo_w:.2f}",
                     "accum": str(accum_steps),
                     "pe": str(pseudo_every),
+                    "thr": f"{current_thr:.3f}",
+                    "cw": f"{cons_w:.2f}",
                 }
             )
 

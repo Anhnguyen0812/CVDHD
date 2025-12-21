@@ -109,6 +109,19 @@ def get_arguments():
                         help="EMA decay for teacher update (typical 0.99-0.999).")
     parser.add_argument("--pseudo-threshold", type=float, default=0.95,
                         help="Confidence threshold for pseudo labels (FixMatch). Low-confidence pixels are ignored.")
+    parser.add_argument("--pseudo-threshold-start", type=float, default=-1.0,
+                        help="FixMatch: optional threshold schedule start value (e.g. 0.99). Set <0 to disable scheduling.")
+    parser.add_argument("--pseudo-threshold-end", type=float, default=-1.0,
+                        help="FixMatch: optional threshold schedule end value (e.g. 0.98). Set <0 to disable scheduling.")
+    parser.add_argument("--pseudo-threshold-ramp", type=int, default=0,
+                        help="FixMatch: linearly ramp threshold from start->end over this many steps. 0 disables.")
+
+    parser.add_argument("--consistency-weight", type=float, default=0.0,
+                        help="FixMatch: weight for teacher-student consistency loss on target logits (0 disables).")
+    parser.add_argument("--consistency-type", type=str, default="kl", choices=["kl", "mse"],
+                        help="FixMatch: consistency loss type between teacher and student probabilities.")
+    parser.add_argument("--consistency-temp", type=float, default=1.0,
+                        help="FixMatch: distillation temperature for consistency loss.")
     parser.add_argument("--strong-brightness", type=float, default=0.2,
                         help="Strong aug: brightness jitter range (0 disables).")
     parser.add_argument("--strong-contrast", type=float, default=0.2,
