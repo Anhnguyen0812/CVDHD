@@ -270,4 +270,38 @@ mkdir -p $PSEUDO_DIR
 Notes:
 - If training becomes unstable, increase `--threshold` (e.g. 0.95) and/or lower `--pseudo-weight` (e.g. 0.05).
 - `--rank-mode mean` usually targets bigger overall gains; `min` targets balanced gains.
+
+---
+
+## 7) FixMatch / UniMatch-lite (EMA teacher + weak->strong) (Python cell)
+
+This is a stronger self-training recipe that often gives larger gains than offline pseudo-label finetune.
+
+```python
+import os
+
+GPU = "0"
+BASE = "/kaggle/working/FIFO_final_model.pth"
+SAVE_DIR = "/kaggle/working/snapshots/FIFO_model"
+SCRATCH_DIR = "/kaggle/temp/snapshots/FIFO_model"
+
+os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(SCRATCH_DIR, exist_ok=True)
+
+%cd /kaggle/working/CVDHD
+
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu {GPU} \
+  --base-ckpt {BASE} \
+  --base-metrics "48.41,48.93,50.71,64.75" \
+  --exp-name FIXMATCH1 \
+  --train-script main_selftrain.py \
+  --train-extra "--fixmatch --pseudo-weight 0.3 --pseudo-threshold 0.95 --ema-decay 0.99 --batch-size 1 --iter-size 4 --num-workers 2" \
+  --scratch-dir {SCRATCH_DIR} \
+  --save-dir {SAVE_DIR} \
+  --safe --safe-steps 400 \
+  --safe-snapshot-every 50 \
+  --rank-mode mean
+```
 ```

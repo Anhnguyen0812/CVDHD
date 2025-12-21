@@ -7,6 +7,7 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.cuda import amp
 from torch.utils import data
 
@@ -21,6 +22,100 @@ from utils.optimisers import get_optimisers, get_lr_schedulers
 
 IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32)
 RESTORE_FROM = "without_pretraining"
+
+
+def _bgr_mean_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    m = torch.tensor([float(IMG_MEAN[0]), float(IMG_MEAN[1]), float(IMG_MEAN[2])], device=device, dtype=dtype)
+    return m.view(1, 3, 1, 1)
+
+
+def _strong_augment_bgr(
+    x_bgr_mean_sub: torch.Tensor,
+    *,
+    mean_bgr: torch.Tensor,
+    brightness: float,
+    contrast: float,
+    saturation: float,
+    noise_std: float,
+    cutout: float,
+    blur: bool,
+) -> torch.Tensor:
+    """Strong photometric + cutout augmentation.
+
+    Expects input in BGR mean-subtracted space (float tensor N,3,H,W).
+    Produces output in the same space.
+    """
+
+    if x_bgr_mean_sub.dim() != 4 or x_bgr_mean_sub.size(1) != 3:
+        raise ValueError(f"Expected (N,3,H,W), got {tuple(x_bgr_mean_sub.shape)}")
+
+    # Convert to [0,1] RGB
+    x = (x_bgr_mean_sub + mean_bgr).clamp(0.0, 255.0) / 255.0
+    x = x[:, [2, 1, 0], :, :]  # BGR -> RGB
+
+    n, _c, h, w = x.shape
+
+    if brightness and brightness > 0:
+        b = (torch.rand((n, 1, 1, 1), device=x.device, dtype=x.dtype) * 2 - 1) * float(brightness)
+        x = (x * (1.0 + b)).clamp(0.0, 1.0)
+
+    if contrast and contrast > 0:
+        c = (torch.rand((n, 1, 1, 1), device=x.device, dtype=x.dtype) * 2 - 1) * float(contrast)
+        mean = x.mean(dim=(2, 3), keepdim=True)
+        x = ((x - mean) * (1.0 + c) + mean).clamp(0.0, 1.0)
+
+    if saturation and saturation > 0:
+        s = (torch.rand((n, 1, 1, 1), device=x.device, dtype=x.dtype) * 2 - 1) * float(saturation)
+        gray = (0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3])
+        x = (x * (1.0 + s) + gray * (-s)).clamp(0.0, 1.0)
+
+    if blur and torch.rand(()) < 0.5:
+        x = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+
+    if noise_std and noise_std > 0 and torch.rand(()) < 0.5:
+        x = (x + torch.randn_like(x) * float(noise_std)).clamp(0.0, 1.0)
+
+    if cutout and cutout > 0 and torch.rand(()) < 0.5:
+        cut = int(max(1, float(cutout) * float(min(h, w))))
+        for i in range(n):
+            cy = int(torch.randint(0, h, (1,), device=x.device).item())
+            cx = int(torch.randint(0, w, (1,), device=x.device).item())
+            y0 = max(0, cy - cut // 2)
+            y1 = min(h, cy + cut // 2)
+            x0 = max(0, cx - cut // 2)
+            x1 = min(w, cx + cut // 2)
+            x[i, :, y0:y1, x0:x1] = 0.0
+
+    # Back to BGR mean-subtracted
+    x = x[:, [2, 1, 0], :, :] * 255.0
+    x = x - mean_bgr
+    return x
+
+
+@torch.no_grad()
+def _ema_update(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    d = float(decay)
+    if d < 0.0:
+        d = 0.0
+    if d > 1.0:
+        d = 1.0
+
+    ema_params = dict(ema_model.named_parameters())
+    model_params = dict(model.named_parameters())
+    for k, p_ema in ema_params.items():
+        p = model_params.get(k)
+        if p is None:
+            continue
+        p_ema.data.mul_(d).add_(p.data, alpha=(1.0 - d))
+
+    # Keep buffers synced (BN stats etc.)
+    ema_buf = dict(ema_model.named_buffers())
+    model_buf = dict(model.named_buffers())
+    for k, b_ema in ema_buf.items():
+        b = model_buf.get(k)
+        if b is None:
+            continue
+        b_ema.data.copy_(b.data)
 
 
 def _strip_module_prefix(state_dict):
@@ -135,19 +230,29 @@ def main():
         set=args.set,
     )
 
+    use_fixmatch = bool(getattr(args, "fixmatch", False))
     pseudo_dir = str(getattr(args, "pseudo_label_dir", "") or "").strip()
-    if not pseudo_dir:
-        raise SystemExit("--pseudo-label-dir is required for main_selftrain.py")
-
-    tgt_dataset = foggyzurichDataSet(
-        args.data_dir_rf,
-        args.data_list_rf,
-        max_iters=args.num_steps * args.iter_size * args.batch_size,
-        mean=IMG_MEAN,
-        set=args.set,
-        pseudo_label_dir=pseudo_dir,
-        return_label=True,
-    )
+    if use_fixmatch:
+        tgt_dataset = foggyzurichDataSet(
+            args.data_dir_rf,
+            args.data_list_rf,
+            max_iters=args.num_steps * args.iter_size * args.batch_size,
+            mean=IMG_MEAN,
+            set=args.set,
+            return_label=False,
+        )
+    else:
+        if not pseudo_dir:
+            raise SystemExit("--pseudo-label-dir is required unless --fixmatch is set")
+        tgt_dataset = foggyzurichDataSet(
+            args.data_dir_rf,
+            args.data_list_rf,
+            max_iters=args.num_steps * args.iter_size * args.batch_size,
+            mean=IMG_MEAN,
+            set=args.set,
+            pseudo_label_dir=pseudo_dir,
+            return_label=True,
+        )
 
     src_loader = data.DataLoader(
         src_dataset,
@@ -176,6 +281,25 @@ def main():
     if pseudo_every < 1:
         pseudo_every = 1
 
+    ema_decay = float(getattr(args, "ema_decay", 0.99))
+    pseudo_thr = float(getattr(args, "pseudo_threshold", 0.95))
+    strong_brightness = float(getattr(args, "strong_brightness", 0.2))
+    strong_contrast = float(getattr(args, "strong_contrast", 0.2))
+    strong_saturation = float(getattr(args, "strong_saturation", 0.2))
+    strong_noise_std = float(getattr(args, "strong_noise_std", 0.02))
+    strong_cutout = float(getattr(args, "strong_cutout", 0.5))
+    strong_blur = bool(int(getattr(args, "strong_blur", 1) or 0))
+
+    mean_bgr = _bgr_mean_tensor(device, dtype=torch.float32)
+
+    ema_model = None
+    if use_fixmatch:
+        ema_model = rf_lw101(num_classes=args.num_classes).to(device)
+        ema_model.load_state_dict(model.state_dict(), strict=True)
+        ema_model.eval()
+        for p in ema_model.parameters():
+            p.requires_grad = False
+
     log_every = int(getattr(args, "log_every", 50) or 0)
 
     pbar = tqdm(range(start_iter, int(args.num_steps)), desc=f"SELFTRAIN {args.file_name}", unit="iter")
@@ -200,8 +324,11 @@ def main():
             # Source labeled batch
             (sf_img, cw_img, src_lbl, size, _sf_name, _cw_name), src_iter = fetch_next(src_iter, src_loader)
             if apply_pseudo:
-                # Target pseudo-labeled batch
-                (tgt_img, tgt_lbl, tgt_size, _tgt_name), tgt_iter = fetch_next(tgt_iter, tgt_loader)
+                if use_fixmatch:
+                    (tgt_img, tgt_size, _tgt_name), tgt_iter = fetch_next(tgt_iter, tgt_loader)
+                    tgt_lbl = None
+                else:
+                    (tgt_img, tgt_lbl, tgt_size, _tgt_name), tgt_iter = fetch_next(tgt_iter, tgt_loader)
 
             with amp.autocast(enabled=bool(args.amp)):
                 interp_src = nn.Upsample(size=(int(size[0][0]), int(size[0][1])), mode="bilinear", align_corners=True)
@@ -210,11 +337,44 @@ def main():
                 loss_src = loss_calc(pred_src, src_lbl.to(device), device)
 
                 if apply_pseudo:
-                    interp_tgt = nn.Upsample(size=(int(tgt_size[0][0]), int(tgt_size[0][1])), mode="bilinear", align_corners=True)
-                    _out6, _out3, _out4, _out5, _out1, out2 = model(tgt_img.to(device))
-                    pred_tgt = interp_tgt(out2)
-                    loss_tgt = loss_calc(pred_tgt, tgt_lbl.to(device), device)
-                    loss = loss_src + (pseudo_w * loss_tgt)
+                    if use_fixmatch:
+                        assert ema_model is not None
+                        x_weak = tgt_img.to(device)
+                        x_strong = _strong_augment_bgr(
+                            x_weak,
+                            mean_bgr=mean_bgr.to(dtype=x_weak.dtype),
+                            brightness=strong_brightness,
+                            contrast=strong_contrast,
+                            saturation=strong_saturation,
+                            noise_std=strong_noise_std,
+                            cutout=strong_cutout,
+                            blur=strong_blur,
+                        )
+
+                        # Teacher (EMA) predicts pseudo-labels on weak
+                        with torch.no_grad():
+                            _t6, _t3, _t4, _t5, _t1, t_out2 = ema_model(x_weak)
+
+                        # Student predicts on strong
+                        _s6, _s3, _s4, _s5, _s1, s_out2 = model(x_strong)
+
+                        interp_tgt = nn.Upsample(size=(int(tgt_size[0][0]), int(tgt_size[0][1])), mode="bilinear", align_corners=True)
+                        t_logits = interp_tgt(t_out2)
+                        s_logits = interp_tgt(s_out2)
+
+                        probs = torch.softmax(t_logits.detach(), dim=1)
+                        conf, pseudo = torch.max(probs, dim=1)
+                        pseudo = pseudo.long()
+                        pseudo = pseudo.masked_fill(conf < float(pseudo_thr), 255)
+
+                        loss_tgt = loss_calc(s_logits, pseudo, device)
+                        loss = loss_src + (pseudo_w * loss_tgt)
+                    else:
+                        interp_tgt = nn.Upsample(size=(int(tgt_size[0][0]), int(tgt_size[0][1])), mode="bilinear", align_corners=True)
+                        _out6, _out3, _out4, _out5, _out1, out2 = model(tgt_img.to(device))
+                        pred_tgt = interp_tgt(out2)
+                        loss_tgt = loss_calc(pred_tgt, tgt_lbl.to(device), device)
+                        loss = loss_src + (pseudo_w * loss_tgt)
                 else:
                     loss_tgt = torch.tensor(0.0, device=device)
                     loss = loss_src
@@ -228,6 +388,9 @@ def main():
         scaler.step(enc_opt)
         scaler.step(dec_opt)
         scaler.update()
+
+        if use_fixmatch and ema_model is not None:
+            _ema_update(ema_model, model, decay=ema_decay)
 
         last_loss = sum_loss
         last_src = sum_src / float(accum_steps)

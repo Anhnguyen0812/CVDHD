@@ -102,6 +102,26 @@ def get_arguments():
     parser.add_argument("--pseudo-every", type=int, default=1,
                         help="Self-train: apply target pseudo-label loss every N iterations (1 = every iter). Use >1 to reduce negative transfer.")
 
+    # FixMatch / UniMatch-lite (EMA teacher + weak->strong consistency)
+    parser.add_argument("--fixmatch", action="store_true",
+                        help="Enable FixMatch-style self-training: EMA teacher predicts pseudo labels on weak target, student learns on strong target with confidence mask.")
+    parser.add_argument("--ema-decay", type=float, default=0.99,
+                        help="EMA decay for teacher update (typical 0.99-0.999).")
+    parser.add_argument("--pseudo-threshold", type=float, default=0.95,
+                        help="Confidence threshold for pseudo labels (FixMatch). Low-confidence pixels are ignored.")
+    parser.add_argument("--strong-brightness", type=float, default=0.2,
+                        help="Strong aug: brightness jitter range (0 disables).")
+    parser.add_argument("--strong-contrast", type=float, default=0.2,
+                        help="Strong aug: contrast jitter range (0 disables).")
+    parser.add_argument("--strong-saturation", type=float, default=0.2,
+                        help="Strong aug: saturation jitter range (0 disables).")
+    parser.add_argument("--strong-noise-std", type=float, default=0.02,
+                        help="Strong aug: Gaussian noise std in [0,1] space (0 disables).")
+    parser.add_argument("--strong-cutout", type=float, default=0.5,
+                        help="Strong aug: cutout size ratio relative to min(H,W) (0 disables).")
+    parser.add_argument("--strong-blur", type=int, default=1,
+                        help="Strong aug: enable simple blur (1=on,0=off).")
+
     # Experiment knobs (optional; only used by specific main_*.py entrypoints)
     parser.add_argument("--fda-beta", type=float, default=0.01,
                         help="FDA: fraction of low-frequency spectrum to swap (typical 0.005-0.05)")
