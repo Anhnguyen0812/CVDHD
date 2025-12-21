@@ -192,6 +192,32 @@ def _replace_or_add_flag(tokens: list[str], flag: str, value: str | None) -> lis
     return out
 
 
+def _normalize_bool_flags(tokens: list[str], *, flags: list[str]) -> list[str]:
+    """Normalize common user input like `--flag 1` for store_true flags.
+
+    Some training scripts define boolean flags as `action='store_true'` and thus
+    DO NOT accept explicit values. Users often write `--fixmatch 1` by habit,
+    which makes argparse error with `unrecognized arguments: 1`.
+
+    This helper removes a single immediate value token after any of `flags` if
+    it looks like a boolean literal (0/1/true/false).
+    """
+
+    bool_vals = {"0", "1", "true", "false"}
+    out: list[str] = []
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        out.append(t)
+        if t in flags and i + 1 < len(tokens):
+            nxt = tokens[i + 1]
+            if not nxt.startswith("--") and nxt.strip().lower() in bool_vals:
+                i += 2
+                continue
+        i += 1
+    return out
+
+
 def parse_base_metrics(s: str) -> dict[str, float] | None:
     """Parse baseline metrics from a string.
 
@@ -612,6 +638,7 @@ def _build_train_cmd(
         cmd.append("--freeze-bn")
     if save_dir:
         cmd += ["--save-dir", save_dir]
+    extra_tokens = _normalize_bool_flags(extra_tokens, flags=["--fixmatch", "--finetune", "--freeze-bn"])
     cmd += extra_tokens
     return cmd
 
