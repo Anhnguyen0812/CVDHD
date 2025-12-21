@@ -117,6 +117,27 @@ If you want SAFE mode to actually *use* FDA (instead of forcing beta=0), set `--
 
 ---
 
+## 2.4 Boundary quick sweep (400 steps, eval every 50)
+
+Use this when you see foggy scores drop quickly: it runs multiple stable Boundary variants for ~400 steps and picks the best checkpoint by `--rank-mode`.
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --base-metrics "48.41,48.93,50.71,64.75" \
+  --exp-name BND_QSW \
+  --scratch-dir $SCRATCH_DIR \
+  --save-dir $SAVE_DIR \
+  --rank-mode min \
+  --boundary-sweep \
+  --boundary-sweep-steps 400 \
+  --boundary-sweep-snapshot-every 50
+```
+
+---
+
 ## 3) SWEEP run (find what hurts / helps quickly)
 
 This runs several short variants (10 steps by default) and prints deltas vs baseline.

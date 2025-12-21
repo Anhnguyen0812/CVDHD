@@ -222,6 +222,94 @@ def find_latest_ckpt(exp_name: str, snapshot_dirs: list[str]) -> str | None:
     return str(matches[0])
 
 
+def find_all_fifo_ckpts_by_step(exp_name: str, snapshot_dirs: list[str]) -> dict[int, str]:
+    """Return a map: step -> checkpoint path for FIFO snapshots.
+
+    If multiple files match the same step (e.g. reruns), keep the most recently modified.
+    """
+
+    patterns = [str(Path(d) / f"*{exp_name}*FIFO*.pth") for d in snapshot_dirs]
+    matches: list[Path] = []
+    for pat in patterns:
+        matches.extend(Path(p) for p in glob.glob(pat))
+
+    step_re = re.compile(r"FIFO(\d+)\.pth$", flags=re.IGNORECASE)
+    best: dict[int, Path] = {}
+    for p in matches:
+        m = step_re.search(str(p).replace("\\", "/"))
+        if not m:
+            continue
+        step = int(m.group(1))
+        prev = best.get(step)
+        if prev is None:
+            best[step] = p
+        else:
+            try:
+                if p.stat().st_mtime > prev.stat().st_mtime:
+                    best[step] = p
+            except OSError:
+                # If stat fails, keep the existing one.
+                pass
+
+    return {st: str(path) for st, path in best.items()}
+
+
+def _resolve_steps_to_eval(
+    requested_steps: list[int],
+    available_ckpts: dict[int, str],
+    *,
+    steps_mode: str,
+    nearest_max_diff: int,
+    dedup: bool,
+) -> tuple[list[int], list[int], dict[int, int]]:
+    """Resolve which steps to evaluate.
+
+    Returns: (steps_to_eval, missing_requested_steps, requested_to_actual_map)
+    """
+
+    mode = (steps_mode or "exact").strip().lower()
+    avail_steps = sorted(available_ckpts.keys())
+    if not avail_steps:
+        return ([], requested_steps[:], {})
+
+    if mode == "available":
+        return (avail_steps, [], {})
+
+    missing: list[int] = []
+    mapping: dict[int, int] = {}
+    out: list[int] = []
+
+    def add_step(step: int) -> None:
+        if dedup and step in out:
+            return
+        out.append(step)
+
+    if mode == "nearest":
+        for r in requested_steps:
+            if r in available_ckpts:
+                mapping[r] = r
+                add_step(r)
+                continue
+            # Find nearest available step
+            nearest = min(avail_steps, key=lambda s: abs(s - r))
+            if abs(nearest - r) <= int(nearest_max_diff):
+                mapping[r] = nearest
+                add_step(nearest)
+            else:
+                missing.append(r)
+        out.sort()
+        return (out, missing, mapping)
+
+    # default: exact
+    for r in requested_steps:
+        if r in available_ckpts:
+            add_step(r)
+        else:
+            missing.append(r)
+    out.sort()
+    return (out, missing, {})
+
+
 def _mean_delta(row: dict) -> float:
     vals: list[float] = []
     for k in ("dFZ", "dFDD", "dFD", "dLindau"):
@@ -291,6 +379,22 @@ def _copy_best_checkpoint(ckpt_path: str, out_path: str) -> str:
     os.makedirs(str(Path(out_path).parent), exist_ok=True)
     shutil.copy2(ckpt_path, out_path)
     return out_path
+
+
+def _variant_label(cfg: dict) -> str:
+    # Small stable label for printing.
+    parts: list[str] = []
+    for k in (
+        "backbone_lr_mult",
+        "head_lr_mult",
+        "boundary_weight",
+        "boundary_lr",
+        "boundary_warmup_steps",
+        "freeze_fogpass_steps",
+    ):
+        if k in cfg:
+            parts.append(f"{k}={cfg[k]}")
+    return ",".join(parts)
 
 
 def inspect_checkpoint(path: str) -> dict:
@@ -463,6 +567,25 @@ def main() -> int:
     # Comma-separated list like: 200,800,2000. If provided with no value, means: no step eval.
     ap.add_argument("--steps", nargs="?", const="", default="200,800,2000")
 
+    ap.add_argument(
+        "--steps-mode",
+        default="exact",
+        choices=["exact", "nearest", "available"],
+        help="How to resolve --steps when snapshots are missing: exact (warn missing), nearest (map to nearest FIFO snapshot), available (ignore --steps and eval all available FIFO steps)",
+    )
+    ap.add_argument(
+        "--steps-nearest-max-diff",
+        type=int,
+        default=0,
+        help="When --steps-mode=nearest, only map requested steps to a snapshot if |requested-available| <= this value. Default 0 (disabled).",
+    )
+    ap.add_argument(
+        "--steps-dedup",
+        action="store_true",
+        default=True,
+        help="Deduplicate resolved steps (useful with --steps-mode=nearest).",
+    )
+
     ap.add_argument("--save-dir", default="")
     ap.add_argument("--snapshot-dir", default="./snapshots/FIFO_model")
 
@@ -530,6 +653,20 @@ def main() -> int:
     ap.add_argument("--sweep", action="store_true", help="Run a small ablation sweep after baseline eval")
     ap.add_argument("--sweep-num-steps", type=int, default=10, help="Train steps per variant when --sweep is set")
     ap.add_argument("--sweep-num-steps-stop", type=int, default=10, help="Stop steps per variant when --sweep is set")
+
+    # Boundary quick sweep: many short Boundary variants with frequent eval
+    ap.add_argument(
+        "--boundary-sweep",
+        action="store_true",
+        help="Run several Boundary hyperparam variants for a short run (default 400 steps) and pick best by --rank-mode",
+    )
+    ap.add_argument("--boundary-sweep-steps", type=int, default=400, help="Train steps for --boundary-sweep")
+    ap.add_argument("--boundary-sweep-snapshot-every", type=int, default=50, help="Snapshot/eval interval for --boundary-sweep")
+    ap.add_argument(
+        "--boundary-sweep-train-script",
+        default="main_boundary.py",
+        help="Trainer entrypoint used for --boundary-sweep (default: main_boundary.py)",
+    )
 
     # Auto-improve: try a small set of recipes and pick best by --rank-mode
     ap.add_argument("--auto-improve", action="store_true", help="Try ProtoCL + Boundary (+ tiny FDA) and pick best checkpoint by --rank-mode")
@@ -777,6 +914,177 @@ def main() -> int:
             )
         else:
             print("\n[COMBO] No checkpoints evaluated/found.")
+
+        print("\nDone.")
+        return 0
+
+    # Boundary sweep mode: run multiple short boundary variants and rank by --rank-mode
+    if bool(getattr(args, "boundary_sweep", False)):
+        mode = str(getattr(args, "rank_mode", "min")).lower()
+        steps = int(getattr(args, "boundary_sweep_steps", 400))
+        snap_every = int(getattr(args, "boundary_sweep_snapshot_every", 50))
+        train_script = str(getattr(args, "boundary_sweep_train_script", "main_boundary.py"))
+
+        # Ensure we actually get a FIFO{steps} snapshot (trainer saves snapshots on i_iter).
+        # Running steps+1 means the loop reaches i_iter==steps.
+        run_steps = steps + 1
+        stop_steps = steps + 1
+
+        stage_save_dir = str(train_save_dir) if str(train_save_dir) else str(snapshot_dirs[0])
+        best_save_dir = str(persist_save_dir) if str(persist_save_dir) else stage_save_dir
+        base_extra_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
+
+        # A small, opinionated set of boundary variants aimed at stability (avoid big foggy drops).
+        # If you want more/other variants later, we can expose this via a config file.
+        variants: list[tuple[str, dict]] = [
+            (
+                "GENTLE_w0.10",
+                {
+                    "backbone_lr_mult": "0.001",
+                    "head_lr_mult": "0.002",
+                    "freeze_fogpass_steps": str(max(2000, stop_steps)),
+                    "boundary_weight": "0.10",
+                    "boundary_lr": "1e-4",
+                    "boundary_warmup_steps": "0",
+                },
+            ),
+            (
+                "GENTLE_w0.20",
+                {
+                    "backbone_lr_mult": "0.001",
+                    "head_lr_mult": "0.002",
+                    "freeze_fogpass_steps": str(max(2000, stop_steps)),
+                    "boundary_weight": "0.20",
+                    "boundary_lr": "1e-4",
+                    "boundary_warmup_steps": "0",
+                },
+            ),
+            (
+                "WARMUP100_w0.10",
+                {
+                    "backbone_lr_mult": "0.001",
+                    "head_lr_mult": "0.002",
+                    "freeze_fogpass_steps": str(max(2000, stop_steps)),
+                    "boundary_weight": "0.10",
+                    "boundary_lr": "1e-4",
+                    "boundary_warmup_steps": "100",
+                },
+            ),
+            (
+                "LOWLR_w0.10",
+                {
+                    "backbone_lr_mult": "0.001",
+                    "head_lr_mult": "0.002",
+                    "freeze_fogpass_steps": str(max(2000, stop_steps)),
+                    "boundary_weight": "0.10",
+                    "boundary_lr": "5e-5",
+                    "boundary_warmup_steps": "0",
+                },
+            ),
+            (
+                "HEADUP_w0.10",
+                {
+                    "backbone_lr_mult": "0.001",
+                    "head_lr_mult": "0.005",
+                    "freeze_fogpass_steps": str(max(2000, stop_steps)),
+                    "boundary_weight": "0.10",
+                    "boundary_lr": "1e-4",
+                    "boundary_warmup_steps": "0",
+                },
+            ),
+            (
+                "FPF_AFTER200_w0.10",
+                {
+                    "backbone_lr_mult": "0.001",
+                    "head_lr_mult": "0.002",
+                    "freeze_fogpass_steps": "200",
+                    "fpf_lr_mult": "0.05",
+                    "boundary_weight": "0.10",
+                    "boundary_lr": "1e-4",
+                    "boundary_warmup_steps": "0",
+                },
+            ),
+        ]
+
+        steps_to_eval = list(range(snap_every, steps + 1, snap_every))
+        if steps not in steps_to_eval:
+            steps_to_eval.append(steps)
+
+        all_variant_best: list[dict] = []
+        overall_best: dict | None = None
+
+        print("\n" + "=" * 10 + f" BOUNDARY SWEEP ({steps} steps, eval every {snap_every}) " + "=" * 10)
+        for suffix, cfg in variants:
+            v_exp = f"{args.exp_name}_BND_{suffix}"
+            cfg_tokens: list[str] = []
+            for k, v in cfg.items():
+                cfg_tokens += [f"--{k.replace('_', '-')}", str(v)]
+
+            v_cmd = _build_train_cmd(
+                train_script=train_script,
+                exp_name=v_exp,
+                base_ckpt=args.base_ckpt,
+                gpu=args.gpu,
+                num_steps=int(run_steps),
+                num_steps_stop=int(stop_steps),
+                backbone_lr_mult=str(cfg.get("backbone_lr_mult", args.backbone_lr_mult)),
+                head_lr_mult=str(cfg.get("head_lr_mult", args.head_lr_mult)),
+                lambda_cl=str(args.lambda_cl),
+                cl_warmup_steps=str(args.cl_warmup_steps),
+                cl_temp=str(args.cl_temp),
+                cl_head_lr=str(args.cl_head_lr),
+                freeze_fogpass_steps=str(cfg.get("freeze_fogpass_steps", args.freeze_fogpass_steps)),
+                fpf_lr_mult=str(cfg.get("fpf_lr_mult", args.fpf_lr_mult)),
+                save_pred_every_early=str(snap_every),
+                save_pred_early_until=str(run_steps + 1),
+                amp=str(args.amp),
+                finetune=bool(args.finetune),
+                freeze_bn=True,
+                save_dir=str(stage_save_dir),
+                extra_tokens=list(base_extra_tokens) + cfg_tokens,
+            )
+
+            print("\n" + "-" * 80)
+            print(f"[VARIANT] {suffix} :: {_variant_label(cfg)}")
+            run(v_cmd, title=f"BND SWEEP TRAIN {v_exp}")
+
+            rows = _evaluate_many(
+                tag_prefix=suffix,
+                exp_name_for_ckpt=v_exp,
+                steps_to_eval=steps_to_eval,
+                snapshot_dirs=snapshot_dirs,
+                final_stop=int(stop_steps),
+                gpu=str(args.gpu),
+                base_metrics=base_metrics,
+            )
+
+            best_row = _pick_best(rows, mode=mode)
+            if best_row is None:
+                print(f"[WARN] No evaluated checkpoints for variant {suffix}")
+                continue
+
+            all_variant_best.append(best_row)
+
+            print(
+                f"[BEST@{suffix}] {best_row['exp']}  dFZ={_fmt(best_row.get('dFZ'))}  dFDD={_fmt(best_row.get('dFDD'))}  dFD={_fmt(best_row.get('dFD'))}  dLindau={_fmt(best_row.get('dLindau'))}"
+            )
+
+            if overall_best is None or _rank_score(best_row, mode=mode) > _rank_score(overall_best, mode=mode):
+                overall_best = best_row
+
+        if all_variant_best:
+            print("\n" + "=" * 10 + " BOUNDARY SWEEP BEST PER VARIANT " + "=" * 10)
+            _print_results_table(all_variant_best)
+
+        if overall_best is not None:
+            print("\n" + "=" * 10 + f" BOUNDARY SWEEP OVERALL BEST ({mode}) " + "=" * 10)
+            print(
+                f"Winner: {overall_best['exp']}  dFZ={_fmt(overall_best.get('dFZ'))}  dFDD={_fmt(overall_best.get('dFDD'))}  dFD={_fmt(overall_best.get('dFD'))}  dLindau={_fmt(overall_best.get('dLindau'))}"
+            )
+            if persist_save_dir and overall_best.get("ckpt"):
+                out_path = str(Path(best_save_dir) / f"{args.exp_name}_BND_SWEEP_BEST.pth")
+                copied = _copy_best_checkpoint(str(overall_best["ckpt"]), out_path)
+                print(f"[PERSIST] Copied best checkpoint -> {copied}")
 
         print("\nDone.")
         return 0
@@ -1294,15 +1602,49 @@ def main() -> int:
     # Evaluate snapshots
     steps = parse_steps(args.steps)
     print("\n[3] Evaluate selected steps:")
-    for step in steps:
-        ckpt = find_ckpt_for_step(args.exp_name, step, snapshot_dirs)
-        if not ckpt:
-            print(f"[WARN] Missing ckpt for step={step} (exp={args.exp_name})")
-            continue
-        print(f"\n[CKPT] step={step} -> {ckpt}")
-        print("inspect:", inspect_checkpoint(ckpt))
-        m = eval_ckpt(f"{args.exp_name}_FIFO{step}", ckpt, args.gpu)
-        print(m)
+
+    if steps:
+        available = find_all_fifo_ckpts_by_step(args.exp_name, snapshot_dirs)
+        avail_steps = sorted(available.keys())
+        if not avail_steps:
+            print(f"[WARN] No FIFO snapshots found for exp={args.exp_name} in: {snapshot_dirs}")
+        else:
+            # Print a compact preview so users understand why some steps are missing.
+            preview = ",".join(str(s) for s in avail_steps[:20])
+            if len(avail_steps) > 20:
+                preview += f",...(+{len(avail_steps)-20})"
+            print(f"[INFO] Available FIFO steps: {preview}")
+
+            steps_to_eval, missing_steps, mapping = _resolve_steps_to_eval(
+                steps,
+                available,
+                steps_mode=str(args.steps_mode),
+                nearest_max_diff=int(args.steps_nearest_max_diff),
+                dedup=bool(args.steps_dedup),
+            )
+
+            if missing_steps and str(args.steps_mode).lower() == "exact":
+                miss_preview = ",".join(str(s) for s in missing_steps[:30])
+                if len(missing_steps) > 30:
+                    miss_preview += f",...(+{len(missing_steps)-30})"
+                print(f"[WARN] Missing ckpt for steps: {miss_preview} (exp={args.exp_name})")
+                print("[HINT] Your snapshot interval may not match --steps. Consider --save-pred-every-early 100 or use --steps-mode nearest/available.")
+
+            if mapping and str(args.steps_mode).lower() == "nearest":
+                # show up to 20 mappings
+                pairs = [f"{r}->{a}" for r, a in sorted(mapping.items())[:20]]
+                more = "" if len(mapping) <= 20 else f" ...(+{len(mapping)-20})"
+                print(f"[INFO] Nearest-step mapping: {', '.join(pairs)}{more}")
+
+            for step in steps_to_eval:
+                ckpt = available.get(step)
+                if not ckpt:
+                    # Shouldn't happen, but stay robust.
+                    continue
+                print(f"\n[CKPT] step={step} -> {ckpt}")
+                print("inspect:", inspect_checkpoint(ckpt))
+                m = eval_ckpt(f"{args.exp_name}_FIFO{step}", ckpt, args.gpu)
+                print(m)
 
     latest = find_latest_ckpt(args.exp_name, snapshot_dirs)
     if latest:
