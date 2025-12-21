@@ -32,10 +32,11 @@ def _load_state_dict_from_checkpoint(obj):
 
 
 def _preprocess_bgr(img_pil: Image.Image) -> torch.Tensor:
-    arr = np.asarray(img_pil, np.float32)
-    arr = arr[:, :, ::-1]  # RGB -> BGR
+    arr = np.asarray(img_pil, dtype=np.float32)
+    # RGB -> BGR. The ::-1 slice can create a negative-stride view; make it contiguous.
+    arr = np.ascontiguousarray(arr[:, :, ::-1])
     arr -= IMG_MEAN
-    arr = arr.transpose((2, 0, 1))
+    arr = np.ascontiguousarray(arr.transpose((2, 0, 1)))
     return torch.from_numpy(arr).unsqueeze(0)
 
 
