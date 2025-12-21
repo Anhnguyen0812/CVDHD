@@ -201,4 +201,52 @@ Optional (often risky): add a tiny FDA stage at the end:
   --combo-proto-weight 0.01 \
   --combo-fda-steps 100 \
   --combo-fda-beta 0.0002
+
+---
+
+## 6) Self-training (pseudo labels) for bigger gains
+
+If you need a larger jump (sometimes ~+1% or more), a common next step is **pseudo-label self-training**:
+
+1) Generate pseudo labels for Foggy Zurich train images using your best checkpoint.
+2) Finetune with `main_selftrain.py` (mixing Cityscapes labeled + Foggy Zurich pseudo-labeled) and pick the best checkpoint by `--rank-mode`.
+
+### 6.1 Generate pseudo labels (write to /kaggle/temp)
+
+```bash
+# Pick a strong teacher checkpoint (example: best overall from COMBO)
+TEACHER=/kaggle/working/snapshots/FIFO_model/COMBO1_BEST_OVERALL.pth
+
+PSEUDO_DIR=/kaggle/temp/pseudo_labels/FZ_LIGHT
+mkdir -p $PSEUDO_DIR
+
+!python generate_pseudo_labels.py \
+  --restore-from $TEACHER \
+  --data-dir-rf /kaggle/input/fifo-dataset \
+  --data-list-rf /kaggle/input/fifo-dataset/foggy_zurich/Foggy_Zurich/lists_file_names/RGB_light_filenames.txt \
+  --out-dir $PSEUDO_DIR \
+  --gpu $GPU \
+  --threshold 0.9 \
+  --scales 1.0,0.8,0.6
+```
+
+### 6.2 Finetune with pseudo labels + select best checkpoint
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $TEACHER \
+  --exp-name SELFTRN1 \
+  --train-script main_selftrain.py \
+  --train-extra "--pseudo-label-dir $PSEUDO_DIR --pseudo-weight 0.1" \
+  --scratch-dir $SCRATCH_DIR \
+  --save-dir $SAVE_DIR \
+  --safe --safe-steps 400 \
+  --rank-mode mean
+```
+
+Notes:
+- If training becomes unstable, increase `--threshold` (e.g. 0.95) and/or lower `--pseudo-weight` (e.g. 0.05).
+- `--rank-mode mean` usually targets bigger overall gains; `min` targets balanced gains.
 ```

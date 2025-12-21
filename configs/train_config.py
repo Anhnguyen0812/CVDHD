@@ -92,6 +92,12 @@ def get_arguments():
     parser.add_argument("--freeze-bn", action="store_true",
                         help="Freeze BatchNorm running stats (set BN layers to eval) during training; useful for resume/finetune with small batch")
 
+    # Self-training / pseudo-label knobs (used by main_selftrain.py)
+    parser.add_argument("--pseudo-label-dir", type=str, default="",
+                        help="Directory containing pseudo labels for Foggy Zurich train images (same relative paths as entries in --data-list-rf)")
+    parser.add_argument("--pseudo-weight", type=float, default=0.1,
+                        help="Weight for pseudo-label loss on target images")
+
     # Experiment knobs (optional; only used by specific main_*.py entrypoints)
     parser.add_argument("--fda-beta", type=float, default=0.01,
                         help="FDA: fraction of low-frequency spectrum to swap (typical 0.005-0.05)")
