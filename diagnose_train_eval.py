@@ -501,6 +501,12 @@ def main() -> int:
     ap.add_argument("--safe", action="store_true", help="Run a conservative short finetune and compare to baseline")
     ap.add_argument("--safe-steps", type=int, default=100, help="Train steps for --safe mode")
     ap.add_argument(
+        "--safe-snapshot-every",
+        type=int,
+        default=50,
+        help="Snapshot/evaluate interval during --safe (default: 50 to reduce eval time)",
+    )
+    ap.add_argument(
         "--safe-batch-size",
         type=int,
         default=0,
@@ -1012,9 +1018,11 @@ def main() -> int:
         safe_backbone_mult = "0.001"
         safe_head_mult = "0.002"
 
-        # Save dense snapshots so we can pick the best checkpoint within these few steps.
-        # (Ending checkpoint is often slightly worse even if an earlier one is better.)
-        safe_snapshot_every = "20" if safe_steps >= 20 else str(max(1, safe_steps // 2))
+        # Save snapshots so we can pick the best checkpoint within these few steps.
+        # Default is 50 to reduce evaluation time; override with --safe-snapshot-every.
+        safe_every = int(getattr(args, "safe_snapshot_every", 50) or 50)
+        safe_every = max(1, min(safe_every, safe_steps))
+        safe_snapshot_every = str(safe_every)
         safe_snapshot_until = str(safe_steps + 1)
 
         safe_extra_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
