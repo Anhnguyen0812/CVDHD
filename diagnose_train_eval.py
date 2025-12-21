@@ -663,6 +663,18 @@ def main() -> int:
     ap.add_argument("--boundary-sweep-steps", type=int, default=400, help="Train steps for --boundary-sweep")
     ap.add_argument("--boundary-sweep-snapshot-every", type=int, default=50, help="Snapshot/eval interval for --boundary-sweep")
     ap.add_argument(
+        "--boundary-sweep-batch-size",
+        type=int,
+        default=1,
+        help="Batch size for Boundary sweep (default 1 to avoid OOM; repo default is 4)",
+    )
+    ap.add_argument(
+        "--boundary-sweep-num-workers",
+        type=int,
+        default=2,
+        help="num-workers for Boundary sweep (default 2; lower can reduce RAM pressure on Kaggle)",
+    )
+    ap.add_argument(
         "--boundary-sweep-train-script",
         default="main_boundary.py",
         help="Trainer entrypoint used for --boundary-sweep (default: main_boundary.py)",
@@ -924,6 +936,8 @@ def main() -> int:
         steps = int(getattr(args, "boundary_sweep_steps", 400))
         snap_every = int(getattr(args, "boundary_sweep_snapshot_every", 50))
         train_script = str(getattr(args, "boundary_sweep_train_script", "main_boundary.py"))
+        bsz = int(getattr(args, "boundary_sweep_batch_size", 1))
+        nworkers = int(getattr(args, "boundary_sweep_num_workers", 2))
 
         # Ensure we actually get a FIFO{steps} snapshot (trainer saves snapshots on i_iter).
         # Running steps+1 means the loop reaches i_iter==steps.
@@ -1016,9 +1030,14 @@ def main() -> int:
         print("\n" + "=" * 10 + f" BOUNDARY SWEEP ({steps} steps, eval every {snap_every}) " + "=" * 10)
         for suffix, cfg in variants:
             v_exp = f"{args.exp_name}_BND_{suffix}"
-            cfg_tokens: list[str] = []
-            for k, v in cfg.items():
-                cfg_tokens += [f"--{k.replace('_', '-')}", str(v)]
+            # Only pass truly extra flags here; avoid duplicating flags already set by _build_train_cmd.
+            cfg_tokens: list[str] = ["--batch-size", str(bsz), "--iter-size", "1", "--num-workers", str(nworkers)]
+            if "boundary_weight" in cfg:
+                cfg_tokens += ["--boundary-weight", str(cfg["boundary_weight"])]
+            if "boundary_lr" in cfg:
+                cfg_tokens += ["--boundary-lr", str(cfg["boundary_lr"])]
+            if "boundary_warmup_steps" in cfg:
+                cfg_tokens += ["--boundary-warmup-steps", str(cfg["boundary_warmup_steps"])]
 
             v_cmd = _build_train_cmd(
                 train_script=train_script,
@@ -1046,7 +1065,12 @@ def main() -> int:
 
             print("\n" + "-" * 80)
             print(f"[VARIANT] {suffix} :: {_variant_label(cfg)}")
-            run(v_cmd, title=f"BND SWEEP TRAIN {v_exp}")
+            try:
+                run(v_cmd, title=f"BND SWEEP TRAIN {v_exp}")
+            except subprocess.CalledProcessError as e:
+                # Common on Kaggle if batch size is too large or memory fragments.
+                print(f"[WARN] Variant failed: {suffix} (exit={e.returncode}). Skipping to next.")
+                continue
 
             rows = _evaluate_many(
                 tag_prefix=suffix,
