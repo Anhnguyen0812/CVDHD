@@ -52,6 +52,8 @@ def get_arguments():
     parser.add_argument("--restore-from", type=str, default=RESTORE_FROM)
     parser.add_argument("--restore-from-fogpass", type=str, default=RESTORE_FROM_fogpass)
     parser.add_argument("--save-pred-every", type=int, default=SAVE_PRED_EVERY)
+    parser.add_argument("--log-every", type=int, default=50,
+                        help="Print a short training progress line every N iterations (0 disables)")
     parser.add_argument("--snapshot-dir", type=str, default=SNAPSHOT_DIR)
     parser.add_argument("--save-dir", type=str, default=SAVE_DIR)
     parser.add_argument("--gpu", type=int, default=0)

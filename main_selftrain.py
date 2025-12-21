@@ -10,6 +10,8 @@ import torch.nn as nn
 from torch.cuda import amp
 from torch.utils import data
 
+from tqdm import tqdm
+
 from model.refinenetlw import rf_lw101
 from utils.losses import CrossEntropy2d
 from dataset.paired_cityscapes import Pairedcityscapes
@@ -171,7 +173,14 @@ def main():
     scaler = amp.GradScaler(enabled=bool(args.amp))
     pseudo_w = float(getattr(args, "pseudo_weight", 0.1))
 
-    for i_iter in range(start_iter, int(args.num_steps)):
+    log_every = int(getattr(args, "log_every", 50) or 0)
+
+    pbar = tqdm(range(start_iter, int(args.num_steps)), desc=f"SELFTRAIN {args.file_name}", unit="iter")
+    last_loss = None
+    last_src = None
+    last_tgt = None
+
+    for i_iter in pbar:
         enc_opt.zero_grad(set_to_none=True)
         dec_opt.zero_grad(set_to_none=True)
 
@@ -194,10 +203,23 @@ def main():
             loss = loss_src + (pseudo_w * loss_tgt)
             loss = loss / float(max(1, int(args.iter_size)))
 
+        last_loss = float(loss.detach().cpu().item())
+        last_src = float(loss_src.detach().cpu().item())
+        last_tgt = float(loss_tgt.detach().cpu().item())
+
         scaler.scale(loss).backward()
         scaler.step(enc_opt)
         scaler.step(dec_opt)
         scaler.update()
+
+        if last_loss is not None:
+            pbar.set_postfix({"loss": f"{last_loss:.3f}", "src": f"{last_src:.3f}", "tgt": f"{last_tgt:.3f}", "pw": f"{pseudo_w:.2f}"})
+
+        if log_every > 0 and (i_iter % log_every == 0):
+            print(
+                f"[SELFTRAIN] iter={i_iter} loss={last_loss:.4f} src={last_src:.4f} tgt={last_tgt:.4f} pseudo_w={pseudo_w}",
+                flush=True,
+            )
 
         # Snapshot interval
         if int(getattr(args, "save_pred_every_early", 0) or 0) > 0 and int(getattr(args, "save_pred_early_until", 0) or 0) > 0:
@@ -213,12 +235,14 @@ def main():
                 {"state_dict": model.state_dict(), "train_iter": i_iter, "args": args},
                 osp.join(snapshot_dir, run_name) + "_FIFO" + str(i_iter) + ".pth",
             )
+            print(f"[SELFTRAIN] snapshot saved: {run_name}_FIFO{i_iter}.pth", flush=True)
 
         if i_iter >= int(args.num_steps_stop) - 1:
             torch.save(
                 {"state_dict": model.state_dict(), "train_iter": i_iter, "args": args},
                 osp.join(snapshot_dir, args.file_name + str(args.num_steps_stop) + ".pth"),
             )
+            print(f"[SELFTRAIN] final saved: {args.file_name}{args.num_steps_stop}.pth", flush=True)
             break
 
     return 0
