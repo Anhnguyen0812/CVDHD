@@ -9,6 +9,8 @@ from PIL import Image
 import torch
 import torch.nn as nn
 
+from tqdm import tqdm
+
 from model.refinenetlw import rf_lw101
 
 IMG_MEAN = np.array((104.00698793, 116.66876762, 122.67891434), dtype=np.float32)
@@ -50,6 +52,8 @@ def main() -> int:
     ap.add_argument("--threshold", type=float, default=0.9, help="Softmax max-prob threshold; below -> ignore (255)")
     ap.add_argument("--scales", default="1.0,0.8,0.6", help="Comma-separated inference scales")
     ap.add_argument("--amp", type=int, default=1)
+    ap.add_argument("--log-every", type=int, default=50, help="Print a progress line every N images")
+    ap.add_argument("--limit", type=int, default=0, help="If >0, only generate first N images (debug)")
 
     args = ap.parse_args()
 
@@ -73,7 +77,13 @@ def main() -> int:
     with open(args.data_list_rf, "r", encoding="utf-8") as f:
         names = [ln.strip() for ln in f if ln.strip()]
 
-    for idx, name in enumerate(names):
+    if int(args.limit) > 0:
+        names = names[: int(args.limit)]
+
+    print(f"Generating {len(names)} pseudo labels into: {out_root}")
+    print(f"threshold={args.threshold} scales={scales} amp={args.amp}")
+
+    for idx, name in enumerate(tqdm(names, desc="Pseudo-labels", unit="img")):
         img_path = osp.join(args.data_dir_rf, f"foggy_zurich/Foggy_Zurich/{name}")
         img = Image.open(img_path).convert("RGB")
         w0, h0 = img.size
@@ -112,8 +122,9 @@ def main() -> int:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(pred, mode="L").save(str(out_path))
 
-        if (idx + 1) % 50 == 0:
-            print(f"[{idx+1}/{len(names)}] wrote {out_path}")
+        log_every = int(args.log_every)
+        if log_every > 0 and (idx + 1) % log_every == 0:
+            print(f"[{idx+1}/{len(names)}] wrote {out_path}", flush=True)
 
     print("Done.")
     return 0
