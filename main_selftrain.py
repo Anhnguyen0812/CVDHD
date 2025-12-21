@@ -172,6 +172,9 @@ def main():
 
     scaler = amp.GradScaler(enabled=bool(args.amp))
     pseudo_w = float(getattr(args, "pseudo_weight", 0.1))
+    pseudo_every = int(getattr(args, "pseudo_every", 1) or 1)
+    if pseudo_every < 1:
+        pseudo_every = 1
 
     log_every = int(getattr(args, "log_every", 50) or 0)
 
@@ -192,11 +195,13 @@ def main():
         sum_loss = 0.0
         sum_src = 0.0
         sum_tgt = 0.0
+        apply_pseudo = (i_iter % pseudo_every) == 0
         for _sub_i in range(accum_steps):
             # Source labeled batch
             (sf_img, cw_img, src_lbl, size, _sf_name, _cw_name), src_iter = fetch_next(src_iter, src_loader)
-            # Target pseudo-labeled batch
-            (tgt_img, tgt_lbl, tgt_size, _tgt_name), tgt_iter = fetch_next(tgt_iter, tgt_loader)
+            if apply_pseudo:
+                # Target pseudo-labeled batch
+                (tgt_img, tgt_lbl, tgt_size, _tgt_name), tgt_iter = fetch_next(tgt_iter, tgt_loader)
 
             with amp.autocast(enabled=bool(args.amp)):
                 interp_src = nn.Upsample(size=(int(size[0][0]), int(size[0][1])), mode="bilinear", align_corners=True)
@@ -204,12 +209,15 @@ def main():
                 pred_src = interp_src(out2)
                 loss_src = loss_calc(pred_src, src_lbl.to(device), device)
 
-                interp_tgt = nn.Upsample(size=(int(tgt_size[0][0]), int(tgt_size[0][1])), mode="bilinear", align_corners=True)
-                _out6, _out3, _out4, _out5, _out1, out2 = model(tgt_img.to(device))
-                pred_tgt = interp_tgt(out2)
-                loss_tgt = loss_calc(pred_tgt, tgt_lbl.to(device), device)
-
-                loss = loss_src + (pseudo_w * loss_tgt)
+                if apply_pseudo:
+                    interp_tgt = nn.Upsample(size=(int(tgt_size[0][0]), int(tgt_size[0][1])), mode="bilinear", align_corners=True)
+                    _out6, _out3, _out4, _out5, _out1, out2 = model(tgt_img.to(device))
+                    pred_tgt = interp_tgt(out2)
+                    loss_tgt = loss_calc(pred_tgt, tgt_lbl.to(device), device)
+                    loss = loss_src + (pseudo_w * loss_tgt)
+                else:
+                    loss_tgt = torch.tensor(0.0, device=device)
+                    loss = loss_src
                 loss = loss / float(accum_steps)
 
             sum_loss += float(loss.detach().cpu().item())
@@ -233,6 +241,7 @@ def main():
                     "tgt": f"{last_tgt:.3f}",
                     "pw": f"{pseudo_w:.2f}",
                     "accum": str(accum_steps),
+                    "pe": str(pseudo_every),
                 }
             )
 

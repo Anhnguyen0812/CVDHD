@@ -99,6 +99,8 @@ def get_arguments():
                         help="Directory containing pseudo labels for Foggy Zurich train images (same relative paths as entries in --data-list-rf)")
     parser.add_argument("--pseudo-weight", type=float, default=0.1,
                         help="Weight for pseudo-label loss on target images")
+    parser.add_argument("--pseudo-every", type=int, default=1,
+                        help="Self-train: apply target pseudo-label loss every N iterations (1 = every iter). Use >1 to reduce negative transfer.")
 
     # Experiment knobs (optional; only used by specific main_*.py entrypoints)
     parser.add_argument("--fda-beta", type=float, default=0.01,
