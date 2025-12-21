@@ -148,3 +148,45 @@ Example: train to 2100 steps, save snapshots at 200/800/2000, then evaluate thos
 Notes:
 - If you see `Missing ckpt for step=...`, it usually means the training saved to a different folder.
   Setting `--save-dir $SAVE_DIR` makes train + eval consistent.
+
+---
+
+## 5) COMBO (combine methods automatically)
+
+This runs Boundary first (safe batch size), selects the best checkpoint by `--rank-mode`, then continues with ProtoCL from that checkpoint.
+It also writes stable files:
+- `$SAVE_DIR/<exp>_BEST_BND.pth`
+- `$SAVE_DIR/<exp>_BEST_PROTO.pth`
+- `$SAVE_DIR/<exp>_BEST_OVERALL.pth`
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --exp-name COMBO1 \
+  --save-dir $SAVE_DIR \
+  --rank-mode min \
+  --combo \
+  --combo-boundary-steps 400 \
+  --combo-proto-steps 200 \
+  --combo-proto-weight 0.01
+```
+
+Optional (often risky): add a tiny FDA stage at the end:
+
+```bash
+!python diagnose_train_eval.py \
+  --repo-dir /kaggle/working/CVDHD \
+  --gpu $GPU \
+  --base-ckpt $BASE \
+  --exp-name COMBO1 \
+  --save-dir $SAVE_DIR \
+  --rank-mode min \
+  --combo \
+  --combo-boundary-steps 400 \
+  --combo-proto-steps 200 \
+  --combo-proto-weight 0.01 \
+  --combo-fda-steps 100 \
+  --combo-fda-beta 0.0002
+```

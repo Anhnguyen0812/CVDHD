@@ -26,6 +26,7 @@ import argparse
 import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -277,6 +278,21 @@ def _evaluate_many(
     return rows
 
 
+def _pick_best(rows: list[dict], *, mode: str) -> dict | None:
+    best = None
+    for r in rows:
+        score = _rank_score(r, mode=mode)
+        if best is None or score > best[0]:
+            best = (score, r)
+    return best[1] if best is not None else None
+
+
+def _copy_best_checkpoint(ckpt_path: str, out_path: str) -> str:
+    os.makedirs(str(Path(out_path).parent), exist_ok=True)
+    shutil.copy2(ckpt_path, out_path)
+    return out_path
+
+
 def inspect_checkpoint(path: str) -> dict:
     try:
         import torch
@@ -509,6 +525,15 @@ def main() -> int:
     ap.add_argument("--auto-snapshot-every", type=int, default=20, help="Snapshot interval during --auto-improve")
     ap.add_argument("--auto-include-fda", action="store_true", help="Also try tiny FDA betas in --auto-improve")
 
+    # Combo: sequentially chain methods and carry forward the best checkpoint
+    ap.add_argument("--combo", action="store_true", help="Chain Boundary -> ProtoCL (optional tiny FDA), selecting best checkpoint after each stage")
+    ap.add_argument("--combo-boundary-steps", type=int, default=400, help="Steps for Boundary stage in --combo")
+    ap.add_argument("--combo-proto-steps", type=int, default=200, help="Steps for ProtoCL stage in --combo")
+    ap.add_argument("--combo-fda-steps", type=int, default=0, help="Steps for optional FDA stage in --combo (0 disables)")
+    ap.add_argument("--combo-proto-weight", default="0.01", help="ProtoCL stage proto-weight")
+    ap.add_argument("--combo-boundary-weight", default="0.10", help="Boundary stage boundary-weight")
+    ap.add_argument("--combo-fda-beta", default="0.0002", help="FDA stage beta (very small recommended)")
+
     args = ap.parse_args()
 
     repo = Path(args.repo_dir)
@@ -543,6 +568,189 @@ def main() -> int:
         print("\n[2] Baseline evaluation (before finetune):")
         base_metrics = eval_ckpt(f"{args.exp_name}_BASE", args.base_ckpt, args.gpu)
         print(base_metrics)
+
+    # Combo mode: sequentially chain methods and carry forward best checkpoint.
+    if bool(getattr(args, "combo", False)):
+        mode = str(getattr(args, "rank_mode", "min"))
+        save_dir = str(args.save_dir) if str(args.save_dir) else str(snapshot_dirs[0])
+        combo_tag = str(args.exp_name)
+
+        def _run_stage(
+            *,
+            stage_name: str,
+            train_script: str,
+            base_ckpt: str,
+            steps: int,
+            extra_tokens: list[str],
+            snapshot_every: int,
+        ) -> tuple[str, dict | None, list[dict]]:
+            stop = steps
+            exp = f"{combo_tag}_{stage_name}"
+
+            cmd = _build_train_cmd(
+                train_script=train_script,
+                exp_name=exp,
+                base_ckpt=base_ckpt,
+                gpu=str(args.gpu),
+                num_steps=int(steps),
+                num_steps_stop=int(stop),
+                backbone_lr_mult="0.001",
+                head_lr_mult="0.002",
+                lambda_cl=str(args.lambda_cl),
+                cl_warmup_steps=str(args.cl_warmup_steps),
+                cl_temp=str(args.cl_temp),
+                cl_head_lr=str(args.cl_head_lr),
+                freeze_fogpass_steps=str(max(2000, steps)),
+                fpf_lr_mult=str(args.fpf_lr_mult),
+                save_pred_every_early=str(snapshot_every),
+                save_pred_early_until=str(steps + 1),
+                amp=str(args.amp),
+                finetune=bool(args.finetune),
+                freeze_bn=True,
+                save_dir=save_dir,
+                extra_tokens=extra_tokens,
+            )
+            run(cmd, title=f"COMBO TRAIN {exp} ({train_script})")
+
+            steps_to_eval = list(range(snapshot_every, steps + 1, snapshot_every))
+            if steps not in steps_to_eval:
+                steps_to_eval.append(steps)
+            rows = _evaluate_many(
+                tag_prefix=f"{stage_name}",
+                exp_name_for_ckpt=exp,
+                steps_to_eval=steps_to_eval,
+                snapshot_dirs=snapshot_dirs,
+                final_stop=stop,
+                gpu=str(args.gpu),
+                base_metrics=base_metrics,
+            )
+            best_row = _pick_best(rows, mode=mode)
+            if best_row is None:
+                return base_ckpt, None, rows
+
+            # Copy best checkpoint to a stable filename for the next stage.
+            out_best = str(Path(save_dir) / f"{combo_tag}_BEST_{stage_name}.pth")
+            copied = _copy_best_checkpoint(str(best_row["ckpt"]), out_best)
+            return copied, best_row, rows
+
+        print("\n[3] COMBO: Boundary -> ProtoCL" + (" -> FDA" if int(getattr(args, "combo_fda_steps", 0)) > 0 else ""))
+
+        # Stage 1: Boundary (memory heavy => force batch-size=1)
+        bnd_steps = int(getattr(args, "combo_boundary_steps", 400))
+        bnd_every = 20 if bnd_steps >= 40 else max(5, bnd_steps // 4)
+        bnd_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
+        bnd_tokens = _replace_or_add_flag(bnd_tokens, "--batch-size", "1")
+        bnd_tokens = _replace_or_add_flag(bnd_tokens, "--num-workers", "2")
+        bnd_tokens += [
+            "--boundary-weight",
+            str(getattr(args, "combo_boundary_weight", "0.10")),
+            "--boundary-warmup-steps",
+            str(min(80, max(20, bnd_steps // 3))),
+            "--boundary-lr",
+            "0.0005",
+        ]
+
+        current_ckpt = str(args.base_ckpt)
+        all_rows: list[dict] = []
+
+        current_ckpt, best_bnd, rows_bnd = _run_stage(
+            stage_name="BND",
+            train_script="main_boundary.py",
+            base_ckpt=current_ckpt,
+            steps=bnd_steps,
+            extra_tokens=bnd_tokens,
+            snapshot_every=bnd_every,
+        )
+        all_rows += rows_bnd
+
+        # Stage 2: ProtoCL (gentle by default)
+        proto_steps = int(getattr(args, "combo_proto_steps", 200))
+        proto_every = 20 if proto_steps >= 40 else max(5, proto_steps // 4)
+        proto_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
+        proto_tokens += [
+            "--proto-weight",
+            str(getattr(args, "combo_proto_weight", "0.01")),
+            "--proto-temp",
+            "0.1",
+            "--proto-momentum",
+            "0.99",
+            "--proto-init-iters",
+            "80",
+        ]
+
+        current_ckpt, best_proto, rows_proto = _run_stage(
+            stage_name="PROTO",
+            train_script="main_proto_cl.py",
+            base_ckpt=current_ckpt,
+            steps=proto_steps,
+            extra_tokens=proto_tokens,
+            snapshot_every=proto_every,
+        )
+        all_rows += rows_proto
+
+        # Optional Stage 3: tiny FDA (often risky; keep very small beta)
+        fda_steps = int(getattr(args, "combo_fda_steps", 0))
+        best_fda = None
+        if fda_steps > 0:
+            fda_every = 20 if fda_steps >= 40 else max(5, fda_steps // 4)
+            fda_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
+            fda_tokens = _replace_or_add_flag(fda_tokens, "--fda-beta", str(getattr(args, "combo_fda_beta", "0.0002")))
+            current_ckpt, best_fda, rows_fda = _run_stage(
+                stage_name="FDA",
+                train_script="main_fda.py",
+                base_ckpt=current_ckpt,
+                steps=fda_steps,
+                extra_tokens=fda_tokens,
+                snapshot_every=fda_every,
+            )
+            all_rows += rows_fda
+
+        # Pick best overall among all evaluated combo checkpoints
+        best_overall = _pick_best(all_rows, mode=mode)
+
+        print("\n" + "=" * 10 + " COMBO SUMMARY " + "=" * 10)
+        base_row = {
+            "exp": "BASE",
+            "FZ": base_metrics.get("FZ"),
+            "FDD": base_metrics.get("FDD"),
+            "FD": base_metrics.get("FD"),
+            "Lindau": base_metrics.get("Lindau"),
+            "dFZ": 0.0,
+            "dFDD": 0.0,
+            "dFD": 0.0,
+            "dLindau": 0.0,
+        }
+        rows_out = [base_row]
+        for r in all_rows:
+            rows_out.append(
+                {
+                    "exp": r.get("exp"),
+                    "FZ": r.get("FZ"),
+                    "FDD": r.get("FDD"),
+                    "FD": r.get("FD"),
+                    "Lindau": r.get("Lindau"),
+                    "dFZ": r.get("dFZ"),
+                    "dFDD": r.get("dFDD"),
+                    "dFD": r.get("dFD"),
+                    "dLindau": r.get("dLindau"),
+                }
+            )
+        _print_results_table(rows_out)
+
+        if best_overall is not None:
+            out_best = str(Path(save_dir) / f"{combo_tag}_BEST_OVERALL.pth")
+            best_path = _copy_best_checkpoint(str(best_overall["ckpt"]), out_best)
+            print(
+                f"\n[COMBO] Best overall by {mode}: {best_overall.get('exp')}\n"
+                f"  ckpt: {best_path}\n"
+                f"  FZ={_fmt(best_overall.get('FZ'))}  FDD={_fmt(best_overall.get('FDD'))}  FD={_fmt(best_overall.get('FD'))}  Lindau={_fmt(best_overall.get('Lindau'))}\n"
+                f"  dFZ={_fmt(best_overall.get('dFZ'))}  dFDD={_fmt(best_overall.get('dFDD'))}  dFD={_fmt(best_overall.get('dFD'))}  dLindau={_fmt(best_overall.get('dLindau'))}"
+            )
+        else:
+            print("\n[COMBO] No checkpoints evaluated/found.")
+
+        print("\nDone.")
+        return 0
 
     # Auto-improve mode: run a small set of conservative recipes and pick best by rank-mode.
     if bool(getattr(args, "auto_improve", False)):
