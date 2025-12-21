@@ -467,6 +467,12 @@ def main() -> int:
     ap.add_argument("--snapshot-dir", default="./snapshots/FIFO_model")
 
     ap.add_argument(
+        "--scratch-dir",
+        default="",
+        help="Optional: store intermediate snapshots here (e.g. /kaggle/temp/snapshots/FIFO_model). Best checkpoints are copied to --save-dir.",
+    )
+
+    ap.add_argument(
         "--train-extra",
         default="",
         help='Extra args passed to trainer as a single string, e.g. "--fda-beta 0.01"',
@@ -541,18 +547,34 @@ def main() -> int:
         raise SystemExit(f"Repo not found: {repo}")
     os.chdir(repo)
 
+    scratch_dir = str(getattr(args, "scratch_dir", "") or "").strip()
+
+    # Train-save dir: where main_*.py writes snapshots/checkpoints.
+    train_save_dir = scratch_dir if scratch_dir else str(args.save_dir)
+
+    # Persistent dir: where we keep only best checkpoints.
+    persist_save_dir = str(args.save_dir) if str(args.save_dir) else ""
+
     # Configure snapshot dirs to search
     snapshot_dirs: list[str] = []
+    if scratch_dir:
+        snapshot_dirs.append(scratch_dir)
     if args.save_dir:
         snapshot_dirs.append(args.save_dir)
     snapshot_dirs.append(args.snapshot_dir)
-    # Kaggle common default if user forgets
+    # Kaggle common defaults
     snapshot_dirs.append("/kaggle/working/snapshots/FIFO_model")
+    snapshot_dirs.append("/kaggle/temp/snapshots/FIFO_model")
     snapshot_dirs = [d for d in dict.fromkeys(snapshot_dirs) if d]
 
     print("\nSnapshot dirs (search order):")
     for d in snapshot_dirs:
         print(" -", d)
+
+    if scratch_dir:
+        print(f"\nScratch dir: {scratch_dir} (intermediate snapshots)")
+    if persist_save_dir:
+        print(f"Persistent save dir: {persist_save_dir} (best checkpoints)")
 
     print("\n[1] Inspect base checkpoint:")
     base_info = inspect_checkpoint(args.base_ckpt)
@@ -572,7 +594,8 @@ def main() -> int:
     # Combo mode: sequentially chain methods and carry forward best checkpoint.
     if bool(getattr(args, "combo", False)):
         mode = str(getattr(args, "rank_mode", "min"))
-        save_dir = str(args.save_dir) if str(args.save_dir) else str(snapshot_dirs[0])
+        stage_save_dir = str(train_save_dir) if str(train_save_dir) else str(snapshot_dirs[0])
+        best_save_dir = str(persist_save_dir) if str(persist_save_dir) else stage_save_dir
         combo_tag = str(args.exp_name)
 
         def _run_stage(
@@ -607,7 +630,7 @@ def main() -> int:
                 amp=str(args.amp),
                 finetune=bool(args.finetune),
                 freeze_bn=True,
-                save_dir=save_dir,
+                save_dir=stage_save_dir,
                 extra_tokens=extra_tokens,
             )
             run(cmd, title=f"COMBO TRAIN {exp} ({train_script})")
@@ -629,7 +652,7 @@ def main() -> int:
                 return base_ckpt, None, rows
 
             # Copy best checkpoint to a stable filename for the next stage.
-            out_best = str(Path(save_dir) / f"{combo_tag}_BEST_{stage_name}.pth")
+            out_best = str(Path(best_save_dir) / f"{combo_tag}_BEST_{stage_name}.pth")
             copied = _copy_best_checkpoint(str(best_row["ckpt"]), out_best)
             return copied, best_row, rows
 
@@ -738,7 +761,7 @@ def main() -> int:
         _print_results_table(rows_out)
 
         if best_overall is not None:
-            out_best = str(Path(save_dir) / f"{combo_tag}_BEST_OVERALL.pth")
+            out_best = str(Path(best_save_dir) / f"{combo_tag}_BEST_OVERALL.pth")
             best_path = _copy_best_checkpoint(str(best_overall["ckpt"]), out_best)
             print(
                 f"\n[COMBO] Best overall by {mode}: {best_overall.get('exp')}\n"
@@ -783,7 +806,7 @@ def main() -> int:
             "amp": str(args.amp),
             "finetune": bool(args.finetune),
             "freeze_bn": True,
-            "save_dir": str(args.save_dir),
+            "save_dir": str(train_save_dir),
         }
 
         # Define recipes (small and fairly safe). These are not guaranteed to improve,
@@ -966,6 +989,17 @@ def main() -> int:
             print("\n[AUTO] No improvement found under selected criterion in this search set.")
             print("[AUTO] You can increase --auto-steps or enable --auto-include-fda to expand the search.")
 
+        # If training snapshots were written to scratch, persist only the selected best checkpoint.
+        if scratch_dir and persist_save_dir and b.get("ckpt"):
+            out_dir = Path(persist_save_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_best = out_dir / f"{args.exp_name}_AUTO_BEST.pth"
+            try:
+                _copy_best_checkpoint(str(b["ckpt"]), str(out_best))
+                print(f"[AUTO] Copied best checkpoint to: {out_best}")
+            except Exception as e:
+                print(f"[AUTO] Warning: failed to copy best checkpoint: {e}")
+
         print("\nDone.")
         return 0
 
@@ -1023,7 +1057,7 @@ def main() -> int:
             amp=str(args.amp),
             finetune=bool(args.finetune),
             freeze_bn=True,
-            save_dir=str(args.save_dir),
+            save_dir=str(train_save_dir),
             extra_tokens=safe_extra_tokens,
         )
 
@@ -1034,15 +1068,13 @@ def main() -> int:
         safe_steps_to_eval: list[int] = []
         try:
             every = int(safe_snapshot_every)
-            if every > 0:
-                safe_steps_to_eval = list(range(every, safe_steps + 1, every))
+            safe_steps_to_eval = list(range(every, safe_steps + 1, every))
         except Exception:
             safe_steps_to_eval = []
         if safe_steps not in safe_steps_to_eval:
             safe_steps_to_eval.append(safe_steps)
 
         for st in safe_steps_to_eval:
-            # Prefer FIFO snapshots when available; fall back to final checkpoint.
             ckpt = find_ckpt_for_step(f"{args.exp_name}_SAFE", st, snapshot_dirs)
             if not ckpt and st == safe_steps:
                 final_name = f"{args.exp_name}_SAFE{safe_stop}.pth"
@@ -1055,6 +1087,7 @@ def main() -> int:
             safe_rows.append(
                 {
                     "exp": f"SAFE@{st}",
+                    "ckpt": ckpt,
                     "FZ": m.get("FZ"),
                     "FDD": m.get("FDD"),
                     "FD": m.get("FD"),
@@ -1093,6 +1126,17 @@ def main() -> int:
                 f"\nBest SAFE checkpoint by {mode}: {b['exp']}  "
                 f"FZ={_fmt(b.get('FZ'))}  FDD={_fmt(b.get('FDD'))}  FD={_fmt(b.get('FD'))}  Lindau={_fmt(b.get('Lindau'))}"
             )
+
+            # If training snapshots were written to scratch, persist only the best checkpoint.
+            if scratch_dir and persist_save_dir and b.get("ckpt"):
+                out_dir = Path(persist_save_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_best = out_dir / f"{args.exp_name}_SAFE_BEST.pth"
+                try:
+                    shutil.copy2(str(b["ckpt"]), str(out_best))
+                    print(f"[SAFE] Copied best checkpoint to: {out_best}")
+                except Exception as e:
+                    print(f"[SAFE] Warning: failed to copy best checkpoint: {e}")
         print("\nDone.")
         return 0
 
@@ -1160,7 +1204,7 @@ def main() -> int:
                 amp=str(args.amp),
                 finetune=bool(args.finetune),
                 freeze_bn=bool(cfg.get("freeze_bn", args.freeze_bn)),
-                save_dir=str(args.save_dir),
+                save_dir=str(train_save_dir),
                 extra_tokens=list(cfg.get("extra_tokens", base_extra_tokens)),
             )
 
@@ -1233,7 +1277,7 @@ def main() -> int:
         amp=str(args.amp),
         finetune=bool(args.finetune),
         freeze_bn=bool(args.freeze_bn),
-        save_dir=str(args.save_dir),
+        save_dir=str(train_save_dir),
         extra_tokens=extra,
     )
 

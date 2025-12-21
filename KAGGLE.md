@@ -24,9 +24,13 @@ GPU=0
 # Base checkpoint (put your path here)
 BASE=/kaggle/working/FIFO_final_model.pth
 
-# Where checkpoints/snapshots should be saved
+# Persistent outputs (keep only best checkpoints here)
 SAVE_DIR=/kaggle/working/snapshots/FIFO_model
 mkdir -p $SAVE_DIR
+
+# Scratch space for intermediate snapshots (prevents /kaggle/working 20GB limit)
+SCRATCH_DIR=/kaggle/temp/snapshots/FIFO_model
+mkdir -p $SCRATCH_DIR
 ```
 
 ---
@@ -59,6 +63,7 @@ SAFE mode is designed to avoid sudden drops and **evaluates multiple checkpoints
   --exp-name FDA \
   --train-script main_fda.py \
   --train-extra "--fda-beta 0.01" \
+  --scratch-dir $SCRATCH_DIR \
   --save-dir $SAVE_DIR \
   --safe --safe-steps 100 \
   --rank-mode min
@@ -73,6 +78,7 @@ If you want SAFE mode to actually *use* FDA (instead of forcing beta=0), set `--
   --base-ckpt $BASE \
   --exp-name FDA \
   --train-script main_fda.py \
+  --scratch-dir $SCRATCH_DIR \
   --save-dir $SAVE_DIR \
   --safe --safe-steps 200 \
   --safe-fda-beta 0.005 \
@@ -88,6 +94,7 @@ If you want SAFE mode to actually *use* FDA (instead of forcing beta=0), set `--
   --base-ckpt $BASE \
   --exp-name PROTO \
   --train-script main_proto_cl.py \
+  --scratch-dir $SCRATCH_DIR \
   --save-dir $SAVE_DIR \
   --safe --safe-steps 100 \
   --rank-mode min
@@ -102,6 +109,7 @@ If you want SAFE mode to actually *use* FDA (instead of forcing beta=0), set `--
   --base-ckpt $BASE \
   --exp-name BOUND \
   --train-script main_boundary.py \
+  --scratch-dir $SCRATCH_DIR \
   --save-dir $SAVE_DIR \
   --safe --safe-steps 100 \
   --rank-mode min
@@ -121,6 +129,7 @@ This runs several short variants (10 steps by default) and prints deltas vs base
   --exp-name FDA \
   --train-script main_fda.py \
   --train-extra "--fda-beta 0.01" \
+  --scratch-dir $SCRATCH_DIR \
   --save-dir $SAVE_DIR \
   --sweep --sweep-num-steps 10 --sweep-num-steps-stop 10 \
   --rank-mode mean
@@ -142,6 +151,7 @@ Example: train to 2100 steps, save snapshots at 200/800/2000, then evaluate thos
   --train-extra "--fda-beta 0.01" \
   --num-steps 2100 --num-steps-stop 2100 \
   --steps 200,800,2000 \
+  --scratch-dir $SCRATCH_DIR \
   --save-dir $SAVE_DIR
 ```
 
@@ -165,6 +175,7 @@ It also writes stable files:
   --gpu $GPU \
   --base-ckpt $BASE \
   --exp-name COMBO1 \
+  --scratch-dir $SCRATCH_DIR \
   --save-dir $SAVE_DIR \
   --rank-mode min \
   --combo \
@@ -181,6 +192,7 @@ Optional (often risky): add a tiny FDA stage at the end:
   --gpu $GPU \
   --base-ckpt $BASE \
   --exp-name COMBO1 \
+  --scratch-dir $SCRATCH_DIR \
   --save-dir $SAVE_DIR \
   --rank-mode min \
   --combo \
