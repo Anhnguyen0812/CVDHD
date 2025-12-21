@@ -180,40 +180,61 @@ def main():
     last_src = None
     last_tgt = None
 
+    accum_steps = int(getattr(args, "iter_size", 1) or 1)
+    if accum_steps < 1:
+        accum_steps = 1
+
     for i_iter in pbar:
         enc_opt.zero_grad(set_to_none=True)
         dec_opt.zero_grad(set_to_none=True)
 
-        # Source labeled batch
-        (sf_img, cw_img, src_lbl, size, _sf_name, _cw_name), src_iter = fetch_next(src_iter, src_loader)
-        # Target pseudo-labeled batch
-        (tgt_img, tgt_lbl, tgt_size, _tgt_name), tgt_iter = fetch_next(tgt_iter, tgt_loader)
+        # True gradient accumulation: accum_steps micro-batches per optimizer step.
+        sum_loss = 0.0
+        sum_src = 0.0
+        sum_tgt = 0.0
+        for _sub_i in range(accum_steps):
+            # Source labeled batch
+            (sf_img, cw_img, src_lbl, size, _sf_name, _cw_name), src_iter = fetch_next(src_iter, src_loader)
+            # Target pseudo-labeled batch
+            (tgt_img, tgt_lbl, tgt_size, _tgt_name), tgt_iter = fetch_next(tgt_iter, tgt_loader)
 
-        with amp.autocast(enabled=bool(args.amp)):
-            interp_src = nn.Upsample(size=(int(size[0][0]), int(size[0][1])), mode="bilinear", align_corners=True)
-            out6, out3, out4, out5, out1, out2 = model(cw_img.to(device))
-            pred_src = interp_src(out2)
-            loss_src = loss_calc(pred_src, src_lbl.to(device), device)
+            with amp.autocast(enabled=bool(args.amp)):
+                interp_src = nn.Upsample(size=(int(size[0][0]), int(size[0][1])), mode="bilinear", align_corners=True)
+                _out6, _out3, _out4, _out5, _out1, out2 = model(cw_img.to(device))
+                pred_src = interp_src(out2)
+                loss_src = loss_calc(pred_src, src_lbl.to(device), device)
 
-            interp_tgt = nn.Upsample(size=(int(tgt_size[0][0]), int(tgt_size[0][1])), mode="bilinear", align_corners=True)
-            out6, out3, out4, out5, out1, out2 = model(tgt_img.to(device))
-            pred_tgt = interp_tgt(out2)
-            loss_tgt = loss_calc(pred_tgt, tgt_lbl.to(device), device)
+                interp_tgt = nn.Upsample(size=(int(tgt_size[0][0]), int(tgt_size[0][1])), mode="bilinear", align_corners=True)
+                _out6, _out3, _out4, _out5, _out1, out2 = model(tgt_img.to(device))
+                pred_tgt = interp_tgt(out2)
+                loss_tgt = loss_calc(pred_tgt, tgt_lbl.to(device), device)
 
-            loss = loss_src + (pseudo_w * loss_tgt)
-            loss = loss / float(max(1, int(args.iter_size)))
+                loss = loss_src + (pseudo_w * loss_tgt)
+                loss = loss / float(accum_steps)
 
-        last_loss = float(loss.detach().cpu().item())
-        last_src = float(loss_src.detach().cpu().item())
-        last_tgt = float(loss_tgt.detach().cpu().item())
+            sum_loss += float(loss.detach().cpu().item())
+            sum_src += float(loss_src.detach().cpu().item())
+            sum_tgt += float(loss_tgt.detach().cpu().item())
+            scaler.scale(loss).backward()
 
-        scaler.scale(loss).backward()
         scaler.step(enc_opt)
         scaler.step(dec_opt)
         scaler.update()
 
+        last_loss = sum_loss
+        last_src = sum_src / float(accum_steps)
+        last_tgt = sum_tgt / float(accum_steps)
+
         if last_loss is not None:
-            pbar.set_postfix({"loss": f"{last_loss:.3f}", "src": f"{last_src:.3f}", "tgt": f"{last_tgt:.3f}", "pw": f"{pseudo_w:.2f}"})
+            pbar.set_postfix(
+                {
+                    "loss": f"{last_loss:.3f}",
+                    "src": f"{last_src:.3f}",
+                    "tgt": f"{last_tgt:.3f}",
+                    "pw": f"{pseudo_w:.2f}",
+                    "accum": str(accum_steps),
+                }
+            )
 
         if log_every > 0 and (i_iter % log_every == 0):
             print(
