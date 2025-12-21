@@ -1082,6 +1082,10 @@ def main() -> int:
                 base_metrics=base_metrics,
             )
 
+            if rows:
+                print("\n[TRAJ] Per-step eval:")
+                _print_results_table(rows)
+
             best_row = _pick_best(rows, mode=mode)
             if best_row is None:
                 print(f"[WARN] No evaluated checkpoints for variant {suffix}")
