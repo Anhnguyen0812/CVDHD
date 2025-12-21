@@ -284,6 +284,23 @@ def find_latest_ckpt(exp_name: str, snapshot_dirs: list[str]) -> str | None:
     return str(matches[0])
 
 
+def find_full_ckpt_for_step(exp_name: str, step: int, snapshot_dirs: list[str]) -> str | None:
+    """Find a *FULL{step}.pth checkpoint for an experiment.
+
+    This is used when training saves lightweight FIFO snapshots but also writes a full
+    training checkpoint at selected steps with suffix _FULL{step}.pth.
+    """
+
+    patterns = [str(Path(d) / f"*{exp_name}*FULL{step}.pth") for d in snapshot_dirs]
+    matches: list[Path] = []
+    for pat in patterns:
+        matches.extend(Path(p) for p in glob.glob(pat))
+    if not matches:
+        return None
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(matches[0])
+
+
 def find_all_fifo_ckpts_by_step(exp_name: str, snapshot_dirs: list[str]) -> dict[int, str]:
     """Return a map: step -> checkpoint path for FIFO snapshots.
 
@@ -725,6 +742,15 @@ def main() -> int:
         type=int,
         default=50,
         help="Snapshot/evaluate interval during --safe (default: 50 to reduce eval time)",
+    )
+
+    ap.add_argument(
+        "--save-best-full",
+        action="store_true",
+        help=(
+            "During --safe: keep FIFO snapshots light, but ask trainer to also save full checkpoints at eval steps; "
+            "then persist ONLY the best as *_SAFE_BEST_FULL.pth (and delete other *_FULL*.pth from scratch)."
+        ),
     )
     ap.add_argument(
         "--safe-batch-size",
@@ -1485,6 +1511,22 @@ def main() -> int:
 
         safe_extra_tokens = args.train_extra.strip().split() if args.train_extra.strip() else []
 
+        # Optionally request full checkpoints at the exact SAFE eval steps, so we can persist only BEST as full.
+        save_best_full = bool(getattr(args, "save_best_full", False))
+
+        if save_best_full:
+            # Predict the SAFE eval steps now (same logic as the post-train eval loop).
+            steps_to_save_full: list[int] = []
+            try:
+                every_i = int(safe_snapshot_every)
+                steps_to_save_full = list(range(every_i, safe_steps + 1, every_i))
+            except Exception:
+                steps_to_save_full = []
+            if safe_steps not in steps_to_save_full:
+                steps_to_save_full.append(safe_steps)
+            steps_csv = ",".join(str(x) for x in sorted(set(steps_to_save_full)))
+            safe_extra_tokens = _replace_or_add_flag(safe_extra_tokens, "--save-full-at-steps", steps_csv)
+
         # Memory safety: Boundary variant is heavy at 2048x1024; default to batch-size=1 in SAFE.
         # User can override via --safe-batch-size or by passing --batch-size in --train-extra.
         safe_bs = int(getattr(args, "safe_batch_size", 0) or 0)
@@ -1604,6 +1646,39 @@ def main() -> int:
                     print(f"[SAFE] Copied best checkpoint to: {out_best}")
                 except Exception as e:
                     print(f"[SAFE] Warning: failed to copy best checkpoint: {e}")
+
+                # Optionally persist a FULL-format checkpoint at the same step.
+                if save_best_full:
+                    try:
+                        step_str = str(b.get("exp", ""))
+                        m = re.search(r"@([0-9]+)$", step_str)
+                        step = int(m.group(1)) if m else None
+                        if step is not None:
+                            full_ckpt = find_full_ckpt_for_step(f"{args.exp_name}_SAFE", step, snapshot_dirs)
+                        else:
+                            full_ckpt = None
+                        if full_ckpt:
+                            out_best_full = out_dir / f"{args.exp_name}_SAFE_BEST_FULL.pth"
+                            shutil.copy2(str(full_ckpt), str(out_best_full))
+                            print(f"[SAFE] Copied best FULL checkpoint to: {out_best_full}")
+                        else:
+                            print("[SAFE] Warning: requested --save-best-full but could not find *_FULL*.pth for the best step.")
+                    except Exception as e:
+                        print(f"[SAFE] Warning: failed to persist best FULL checkpoint: {e}")
+
+                    # Cleanup scratch full checkpoints for this SAFE run to save space.
+                    if scratch_dir:
+                        try:
+                            pat = str(Path(scratch_dir) / f"*{args.exp_name}_SAFE*FULL*.pth")
+                            for p in glob.glob(pat):
+                                # keep the one we already copied (safe to delete scratch anyway)
+                                try:
+                                    os.remove(p)
+                                except OSError:
+                                    pass
+                            print("[SAFE] Cleaned up scratch FULL checkpoints.")
+                        except Exception:
+                            pass
         print("\nDone.")
         return 0
 
