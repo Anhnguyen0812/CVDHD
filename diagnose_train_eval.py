@@ -81,9 +81,11 @@ def _rank_score(
 
         Modes:
             - fdd: prioritize Foggy Driving Dense
+            - fz: prioritize Foggy Zurich
             - mean: prioritize mean improvement across datasets
             - min: prioritize worst-case (minimum) improvement across datasets
             - foggy3: prioritize mean improvement on FZ/FDD/FD (optionally constrain Lindau drop)
+            - foggy3_fz: like foggy3, but tie-break prioritizes dFZ
     """
 
     d_fz = row.get("dFZ")
@@ -125,6 +127,10 @@ def _rank_score(
     if m == "min":
         # Best worst-case; break ties with mean and FDD.
         return (min_delta, mean_delta, d_fdd_v, d_fz_v)
+    if m == "fz":
+        # Maximize Foggy Zurich; keep Lindau from collapsing (via lindau_max_drop);
+        # break ties with FDD then overall mean.
+        return (d_fz_v, d_fdd_v, mean_delta, d_lindau_v)
     if m == "mean":
         # Best average; break ties with min and FDD.
         return (mean_delta, min_delta, d_fdd_v, d_fz_v)
@@ -132,6 +138,9 @@ def _rank_score(
         # Maximize foggy mean; keep Lindau from collapsing (via lindau_max_drop);
         # break ties by Lindau delta, then foggy worst-case, then overall mean.
         return (foggy_mean, d_lindau_v, foggy_min, mean_delta)
+    if m == "foggy3_fz":
+        # Maximize foggy mean; tie-break by dFZ (user preference), then dLindau.
+        return (foggy_mean, d_fz_v, d_lindau_v, foggy_min)
     # Default: fdd
     return (d_fdd_v, d_fz_v, mean_delta, min_delta)
 
@@ -706,10 +715,12 @@ def main() -> int:
     ap.add_argument(
         "--rank-mode",
         default="fdd",
-        choices=["fdd", "mean", "min", "foggy3"],
+        choices=["fdd", "fz", "mean", "min", "foggy3", "foggy3_fz"],
         help=(
-            "How to select best checkpoint/variant: fdd (default), mean (balanced avg delta), "
-            "min (balanced worst-case delta), foggy3 (maximize FZ/FDD/FD mean; optional Lindau constraint)"
+            "How to select best checkpoint/variant: fdd (default), fz (maximize dFZ), "
+            "mean (balanced avg delta), min (balanced worst-case delta), "
+            "foggy3 (maximize FZ/FDD/FD mean; optional Lindau constraint), "
+            "foggy3_fz (foggy3 + prefer dFZ ties)"
         ),
     )
 
@@ -1548,8 +1559,8 @@ def main() -> int:
         }
         rows_out = [base_row] + safe_rows
         _print_results_table(rows_out)
-        if best is not None:
-            b = best[1]
+        if best_row is not None:
+            b = best_row
             mode = str(getattr(args, "rank_mode", "fdd")).lower()
             print(
                 f"\nBest SAFE checkpoint by {mode}: {b['exp']}  "
