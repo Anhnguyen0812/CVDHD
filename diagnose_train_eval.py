@@ -69,34 +69,57 @@ def _delta(v: float | None, base: float | None) -> float | None:
     return v - base
 
 
-def _rank_score(row: dict, *, mode: str) -> tuple[float, float, float, float]:
+def _rank_score(
+    row: dict,
+    *,
+    mode: str,
+    lindau_max_drop: float | None = None,
+) -> tuple[float, float, float, float]:
     """Return a sortable score tuple for a result row.
 
     Higher is better. Uses deltas (dFZ/dFDD/dFD/dLindau) when present.
 
-    Modes:
-      - fdd: prioritize Foggy Driving Dense
-      - mean: prioritize mean improvement across datasets
-      - min: prioritize worst-case (minimum) improvement across datasets
+        Modes:
+            - fdd: prioritize Foggy Driving Dense
+            - mean: prioritize mean improvement across datasets
+            - min: prioritize worst-case (minimum) improvement across datasets
+            - foggy3: prioritize mean improvement on FZ/FDD/FD (optionally constrain Lindau drop)
     """
 
-    deltas: list[float] = []
-    for k in ("dFZ", "dFDD", "dFD", "dLindau"):
-        v = row.get(k)
-        if isinstance(v, float):
-            deltas.append(v)
+    d_fz = row.get("dFZ")
+    d_fdd = row.get("dFDD")
+    d_fd = row.get("dFD")
+    d_lindau = row.get("dLindau")
 
-    if not deltas:
+    d_fz_v = float(d_fz) if isinstance(d_fz, float) else -1e9
+    d_fdd_v = float(d_fdd) if isinstance(d_fdd, float) else -1e9
+    d_fd_v = float(d_fd) if isinstance(d_fd, float) else -1e9
+    d_lindau_v = float(d_lindau) if isinstance(d_lindau, float) else -1e9
+
+    # Optional hard constraint: reject checkpoints that drop Lindau too much.
+    # Example: lindau_max_drop=0.20 => require dLindau >= -0.20.
+    if lindau_max_drop is not None and isinstance(d_lindau, float):
+        if d_lindau < -float(lindau_max_drop):
+            return (-1e12, -1e12, -1e12, -1e12)
+
+    deltas_all: list[float] = []
+    for v in (d_fz, d_fdd, d_fd, d_lindau):
+        if isinstance(v, float):
+            deltas_all.append(v)
+
+    if not deltas_all:
         mean_delta = -1e9
         min_delta = -1e9
     else:
-        mean_delta = sum(deltas) / len(deltas)
-        min_delta = min(deltas)
+        mean_delta = sum(deltas_all) / len(deltas_all)
+        min_delta = min(deltas_all)
 
-    d_fdd = row.get("dFDD")
-    d_fz = row.get("dFZ")
-    d_fdd_v = float(d_fdd) if isinstance(d_fdd, float) else -1e9
-    d_fz_v = float(d_fz) if isinstance(d_fz, float) else -1e9
+    foggy_deltas: list[float] = []
+    for v in (d_fz, d_fdd, d_fd):
+        if isinstance(v, float):
+            foggy_deltas.append(v)
+    foggy_mean = sum(foggy_deltas) / len(foggy_deltas) if foggy_deltas else -1e9
+    foggy_min = min(foggy_deltas) if foggy_deltas else -1e9
 
     m = (mode or "fdd").strip().lower()
     if m == "min":
@@ -105,6 +128,10 @@ def _rank_score(row: dict, *, mode: str) -> tuple[float, float, float, float]:
     if m == "mean":
         # Best average; break ties with min and FDD.
         return (mean_delta, min_delta, d_fdd_v, d_fz_v)
+    if m == "foggy3":
+        # Maximize foggy mean; keep Lindau from collapsing (via lindau_max_drop);
+        # break ties by Lindau delta, then foggy worst-case, then overall mean.
+        return (foggy_mean, d_lindau_v, foggy_min, mean_delta)
     # Default: fdd
     return (d_fdd_v, d_fz_v, mean_delta, min_delta)
 
@@ -366,10 +393,44 @@ def _evaluate_many(
     return rows
 
 
-def _pick_best(rows: list[dict], *, mode: str) -> dict | None:
+def _pick_best(
+    rows: list[dict],
+    *,
+    mode: str,
+    lindau_max_drop: float | None = None,
+    label: str = "",
+) -> dict | None:
+    """Pick the best row under an optional Lindau-drop constraint.
+
+    If the constraint is enabled but no row satisfies it, fall back to
+    unconstrained selection and print a warning.
+    """
+
+    if lindau_max_drop is None:
+        lindau_max_drop = float(getattr(args, "lindau_max_drop", 0.0) or 0.0)
+    lindau_max_drop = float(lindau_max_drop)
+    enforce_drop: float | None = lindau_max_drop if lindau_max_drop > 0 else None
+
+    rows_to_rank = rows
+    if enforce_drop is not None:
+        valid_rows = [
+            r
+            for r in rows
+            if isinstance(r.get("dLindau"), float) and float(r.get("dLindau")) >= -enforce_drop
+        ]
+        if valid_rows:
+            rows_to_rank = valid_rows
+        else:
+            tag = f"{label}: " if label else ""
+            print(
+                f"[WARN] {tag}No checkpoint satisfies Lindau constraint (dLindau >= -{enforce_drop:.2f}). "
+                "Falling back to unconstrained selection."
+            )
+            enforce_drop = None
+
     best = None
-    for r in rows:
-        score = _rank_score(r, mode=mode)
+    for r in rows_to_rank:
+        score = _rank_score(r, mode=mode, lindau_max_drop=enforce_drop)
         if best is None or score > best[0]:
             best = (score, r)
     return best[1] if best is not None else None
@@ -645,8 +706,21 @@ def main() -> int:
     ap.add_argument(
         "--rank-mode",
         default="fdd",
-        choices=["fdd", "mean", "min"],
-        help="How to select best checkpoint/variant: fdd (default), mean (balanced avg delta), min (balanced worst-case delta)",
+        choices=["fdd", "mean", "min", "foggy3"],
+        help=(
+            "How to select best checkpoint/variant: fdd (default), mean (balanced avg delta), "
+            "min (balanced worst-case delta), foggy3 (maximize FZ/FDD/FD mean; optional Lindau constraint)"
+        ),
+    )
+
+    ap.add_argument(
+        "--lindau-max-drop",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional: enforce Lindau does not drop more than this amount (delta). "
+            "Example: 0.20 => require dLindau >= -0.20. 0 disables."
+        ),
     )
 
     # Ablation sweep: runs several short finetunes and compares deltas vs baseline
@@ -1097,7 +1171,16 @@ def main() -> int:
                 f"[BEST@{suffix}] {best_row['exp']}  dFZ={_fmt(best_row.get('dFZ'))}  dFDD={_fmt(best_row.get('dFDD'))}  dFD={_fmt(best_row.get('dFD'))}  dLindau={_fmt(best_row.get('dLindau'))}"
             )
 
-            if overall_best is None or _rank_score(best_row, mode=mode) > _rank_score(overall_best, mode=mode):
+            lindau_max_drop = float(getattr(args, "lindau_max_drop", 0.0) or 0.0)
+            if overall_best is None or _rank_score(
+                best_row,
+                mode=mode,
+                lindau_max_drop=(lindau_max_drop if lindau_max_drop > 0 else None),
+            ) > _rank_score(
+                overall_best,
+                mode=mode,
+                lindau_max_drop=(lindau_max_drop if lindau_max_drop > 0 else None),
+            ):
                 overall_best = best_row
 
         if all_variant_best:
@@ -1271,7 +1354,8 @@ def main() -> int:
                 # Add recipe label for easier tables
                 r["recipe"] = name
                 all_rows.append(r)
-                score = _rank_score(r, mode=mode)
+                lindau_max_drop = float(getattr(args, "lindau_max_drop", 0.0) or 0.0)
+                score = _rank_score(r, mode=mode, lindau_max_drop=(lindau_max_drop if lindau_max_drop > 0 else None))
                 if best is None or score > best[0]:
                     best = (score, r)
 
@@ -1443,12 +1527,13 @@ def main() -> int:
                 }
             )
 
-        # Choose best checkpoint according to rank-mode (fdd/mean/min)
-        best = None
-        for r in safe_rows:
-            score = _rank_score(r, mode=str(getattr(args, "rank_mode", "fdd")))
-            if best is None or score > best[0]:
-                best = (score, r)
+        # Choose best checkpoint according to rank-mode (supports foggy3 + Lindau constraint)
+        best_row = _pick_best(
+            safe_rows,
+            mode=str(getattr(args, "rank_mode", "fdd")),
+            lindau_max_drop=float(getattr(args, "lindau_max_drop", 0.0) or 0.0),
+            label="SAFE",
+        )
         print("\n" + "=" * 10 + " SAFE SUMMARY " + "=" * 10)
         base_row = {
             "exp": "BASE",
@@ -1581,16 +1666,16 @@ def main() -> int:
 
         print("\n" + "=" * 10 + " SWEEP SUMMARY " + "=" * 10)
         _print_results_table(rows)
-        # Report best sweep variant by the chosen rank-mode
-        best_v = None
-        for r in rows:
-            if r.get("exp") == "BASE":
-                continue
-            score = _rank_score(r, mode=str(getattr(args, "rank_mode", "fdd")))
-            if best_v is None or score > best_v[0]:
-                best_v = (score, r)
-        if best_v is not None:
-            b = best_v[1]
+        # Report best sweep variant by the chosen rank-mode (supports Lindau constraint)
+        sweep_rows = [r for r in rows if r.get("exp") != "BASE"]
+        best_row = _pick_best(
+            sweep_rows,
+            mode=str(getattr(args, "rank_mode", "fdd")),
+            lindau_max_drop=float(getattr(args, "lindau_max_drop", 0.0) or 0.0),
+            label="SWEEP",
+        )
+        if best_row is not None:
+            b = best_row
             mode = str(getattr(args, "rank_mode", "fdd")).lower()
             print(
                 f"\nBest SWEEP variant by {mode}: {b['exp']}  "
