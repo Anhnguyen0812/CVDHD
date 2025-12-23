@@ -1,0 +1,189 @@
+\documentclass[pdflatex,sn-mathphys-num]{sn-jnl}
+
+%%%% Standard Packages
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{amsthm}
+\usepackage{mathrsfs}
+\usepackage[title]{appendix}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{multirow}
+\usepackage[utf8]{inputenc}
+
+\raggedbottom
+
+\begin{document}
+
+\title[Enhanced FIFO for Foggy Segmentation]{Enhancing Foggy Scene Segmentation via Edge-Aware Constraints and Fourier Spectral Decomposition}
+
+%% Authors Information - Group of 5 Members
+\author*[1]{\sur{Nguyen Phi Anh}}\email{23020009@vnu.edu.vn}
+\author[1]{ \sur{Nguyen Thac Cuong}}\email{23020018@vnu.edu.vn}
+\author[1]{ \sur{Nguyen Van Dai}}\email{23020009@vnu.edu.vn}
+\author[1]{ \sur{Pham Khac Tiep}}\email{23020009@vnu.edu.vn}
+\author[1]{ \sur{Hoang Quoc Viet}}\email{23020009@vnu.edu.vn}
+
+\affil*[1]{\orgdiv{University of Engineering and Technology}, \orgname{Vietnam National University Hanoi}}
+
+%% Abstract
+\abstract{
+Dense semantic segmentation under adverse weather remains challenging due to large domain shifts between clean and foggy images. This report presents a practical training and model-selection pipeline that improves fog-domain mean Intersection-over-Union (mIoU) while constraining performance changes on a clean validation subset. Starting from a RefineNet-LW101 baseline trained on Cityscapes, we use (i) a compute-friendly \emph{SAFE} short-run protocol that evaluates multiple intermediate checkpoints and selects the best model under a constrained objective, and (ii) an online FixMatch-style self-training method with an exponential moving average (EMA) teacher, weak-to-strong consistency, and confidence masking for pseudo-labels. We also define a fog-focused ranking rule that prioritizes Foggy Zurich and Foggy Driving benchmarks while limiting the allowable drop on the clean Lindau split. The final selected checkpoint achieves \textbf{FZ 49.70, FDD 49.75, FD 50.99, Lindau 64.99} from a baseline of \textbf{48.41/48.93/50.71/64.75}, satisfying the constraint that Lindau does not decrease by more than 0.2 mIoU.
+}
+
+\keywords{Semantic Segmentation, Domain Adaptation, Foggy Scenes, Self-Training, FixMatch, EMA Teacher, Model Selection}
+
+\maketitle
+
+\section{Introduction}
+Semantic segmentation is a key component for autonomous driving systems, enabling pixel-wise understanding of urban scenes. However, models trained on clear-weather datasets often fail under adverse conditions such as fog, due to distribution shifts in illumination, contrast, and visibility. Acquiring dense pixel annotations for real fog is expensive, motivating domain adaptation and semi-supervised learning techniques.
+
+This report focuses on a pragmatic goal: \emph{maximize segmentation performance on foggy benchmarks while preventing excessive degradation on a clean benchmark}. Instead of proposing a new backbone, we improve the training procedure, model selection, and checkpointing workflow so that a single-GPU environment (e.g., Kaggle) can reliably search for a strong finetuned model.
+
+    	extbf{Contributions.} The main contributions are:
+\begin{itemize}
+    \item A \textbf{SAFE short-run protocol} that evaluates frequent checkpoints and selects the best model under a constrained objective.
+    \item An \textbf{online FixMatch-style self-training} recipe for foggy target images using an EMA teacher, weak-to-strong augmentation, and confidence masking.
+    \item A \textbf{constraint-aware ranking rule} that prioritizes fog performance while enforcing an upper bound on clean-domain degradation.
+    \item A \textbf{storage-friendly checkpointing workflow} that keeps intermediate snapshots lightweight and persists only the best checkpoint(s).
+\end{itemize}
+
+\section{Background}
+\subsection{Semantic segmentation and mIoU}
+Given an image $x$ and a segmentation model $f_{\theta}$, the output is a per-pixel categorical distribution over $C$ classes. Performance is measured by mean Intersection-over-Union (mIoU), averaged over classes.
+
+\subsection{Domain shift under fog}
+Fog introduces contrast attenuation and airlight, which modify local textures and long-range visibility. Models trained on clear scenes often become overconfident on wrong classes or fail on fine boundaries.
+
+\subsection{Self-training with pseudo-labels}
+Self-training leverages unlabeled target images by assigning pseudo-labels using a teacher model and training a student with those labels. A common stabilizing technique is confidence masking, where only high-confidence pixels contribute to the target loss.
+
+\section{Related Work}
+    	extbf{Foggy scene segmentation.} FIFO learns fog-invariant features by modeling fog as a style factor and optimizing a fog-related representation across domains \cite{fifo}.
+
+    	extbf{Unsupervised domain adaptation (UDA).} Adversarial feature alignment methods such as DANN \cite{dann} learn domain-invariant representations, while image-level translation approaches attempt to bridge the gap in pixel space. Frequency-domain adaptation (FDA) swaps low-frequency spectrum components between domains \cite{fda}.
+
+	extbf{Mean Teacher and consistency training.} EMA teachers and consistency objectives have shown strong performance in semi-supervised learning and adaptation \cite{mean_teacher}.
+
+	extbf{FixMatch.} FixMatch combines pseudo-labeling from weakly augmented images with consistency training on strongly augmented images, filtering by confidence \cite{fixmatch}.
+
+\section{The Proposed Method}
+\subsection{Overview}
+Starting from a Cityscapes-trained model, we finetune using labeled source images and unlabeled foggy target images. The method consists of two layers:
+\begin{enumerate}
+    \item \textbf{Training recipe:} online FixMatch-style self-training with EMA teacher and confidence masking.
+    \item \textbf{Model selection:} SAFE runs that evaluate checkpoints frequently and select a final checkpoint under a constrained ranking objective.
+\end{enumerate}
+
+\subsection{Online FixMatch-style self-training}
+Let $x_s, y_s$ be labeled source samples and $x_t$ be unlabeled target samples. We update student parameters $\theta$ using:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{src}(f_{\theta}(x_s), y_s) + \lambda_p\, \mathcal{L}_{tgt}(f_{\theta}(\mathcal{A}_s(x_t)), \hat{y}_t),
+\end{equation}
+where $\mathcal{A}_s$ is a strong augmentation, and $\hat{y}_t$ is produced by an EMA teacher $f_{\bar{\theta}}$ on a weakly augmented view:
+\begin{align}
+    p_t &= \mathrm{softmax}(f_{\bar{\theta}}(\mathcal{A}_w(x_t))),\\
+    \hat{y}_t &= \arg\max_c\, p_t^{(c)},\quad \text{masked if } \max_c p_t^{(c)} < \tau.
+\end{align}
+The EMA teacher is updated as $\bar{\theta} \leftarrow \alpha\bar{\theta} + (1-\alpha)\theta$.
+
+\subsection{Consistency loss (optional)}
+The implementation additionally supports a teacher--student consistency term on the masked pixels (e.g., KL divergence or MSE over probabilities). While not strictly required for the final selected checkpoint, this option can improve stability in some runs.
+
+\subsection{SAFE protocol and constraint-aware ranking}
+A recurring failure mode during adaptation is \emph{late-stage drift}: fog performance may increase while clean performance drops, or vice versa. To mitigate this, we use SAFE runs:
+\begin{itemize}
+    \item Run a short finetuning schedule (e.g., 800--2000 steps).
+    \item Save and evaluate checkpoints every $k$ steps.
+    \item Select the best checkpoint according to a constrained objective.
+\end{itemize}
+
+We define a fog-prioritized score using the deltas (improvements) over the baseline on Foggy Zurich (FZ), Foggy Driving Dense (FDD), and Foggy Driving (FD). The selected checkpoint must satisfy:
+\begin{equation}
+    \Delta \mathrm{Lindau} \ge -0.2.
+\end{equation}
+Among valid checkpoints, we maximize the mean improvement on the fog benchmarks, with a tie-break preference toward $\Delta\mathrm{FZ}$.
+
+\subsection{Efficient checkpointing under limited storage}
+To avoid storage exhaustion, intermediate snapshots are kept lightweight and only the best checkpoint(s) are persisted. When a resume-ready checkpoint is needed, full checkpoints are saved only at selected evaluation steps so that the final best model can be exported without saving many large files.
+
+\section{Experiments}
+\subsection{Datasets}
+    extbf{Cityscapes.} A clear-weather urban street-scene dataset with 19 semantic classes \cite{cityscapes}.
+
+    extbf{Foggy Zurich (FZ).} A foggy driving dataset used as an unlabeled target domain for training and as an evaluation benchmark \cite{foggy_zurich}.
+
+    extbf{Foggy Driving (FD/FDD).} Foggy Driving and its dense split (Foggy Driving Dense) serve as additional fog-domain evaluations \cite{foggy_driving}.
+
+    extbf{Lindau.} A clean Cityscapes subset used as a stability benchmark to prevent regressions on clear conditions.
+
+\subsection{Setup}
+    extbf{Backbone and training.} We use RefineNet-LW101 as the segmentation model. Training uses mixed precision (AMP). Due to memory constraints, we use batch size 1 with gradient accumulation (effective batch size increased via iter-size).
+
+    extbf{FixMatch parameters.} We use an EMA teacher with decay $\alpha \in [0.99, 0.999]$, confidence threshold $\tau$ (e.g., 0.97), and strong augmentations (brightness/contrast/saturation jitter, optional cutout/noise/blur).
+
+    extbf{Model selection.} SAFE evaluates checkpoints every 100--200 steps and selects the best model using the constrained fog ranking objective described above.
+
+\subsection{Results}
+Table~\ref{tab:main} reports baseline and final selected checkpoint metrics.
+
+\begin{table}[t]
+\centering
+\caption{Baseline vs. final selected checkpoint (mIoU, higher is better). Deltas are computed w.r.t. baseline.}\label{tab:main}
+\begin{tabular}{lcccc}
+        oprule
+Model & FZ & FDD & FD & Lindau \\
+\midrule
+Baseline & 48.41 & 48.93 & 50.71 & 64.75 \\
+Final (SAFE@200) & 49.70 & 49.75 & 50.99 & 64.99 \\
+\midrule
+$\Delta$ & +1.29 & +0.82 & +0.28 & +0.24 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+    	extbf{Discussion.} We observed that some aggressive settings can increase Lindau while degrading fog performance (a ``pull-back'' toward the clear domain). SAFE model selection is essential to avoid selecting such late-stage drifts. In contrast, the best fog-oriented checkpoint often occurs early in training.
+
+\section{Conclusion}
+This report presented a practical domain adaptation pipeline for foggy scene segmentation, combining online FixMatch-style self-training with a SAFE checkpoint-evaluation protocol and a constrained ranking rule. The final selected checkpoint improves fog mIoU across multiple benchmarks while respecting a strict constraint on clean-domain degradation.
+
+	extbf{Limitations and future work.} Full state recovery is only possible if full checkpoints are saved during training. Converting lightweight checkpoints into full ones can enable format compatibility but cannot reconstruct the exact optimizer trajectory. Future work may explore class-balanced pseudo-labeling and more principled uncertainty estimation.
+
+\appendix
+\section{Reproducibility Notes}
+This appendix provides a minimal summary of the reproducible workflow:
+\begin{itemize}
+    \item Use lightweight intermediate snapshots and persist only best checkpoints.
+    \item Run SAFE finetuning with frequent evaluation (e.g., every 100--200 steps).
+    \item Select best by fog-prioritized constrained objective (Lindau max drop $\le 0.2$).
+\end{itemize}
+
+\begin{thebibliography}{99}
+\bibitem{fifo}
+Lee, S., Son, T., Kwak, S. FIFO: Learning Fog-invariant Features for Foggy Scene Segmentation. arXiv preprint arXiv:2204.01587, 2022. https://arxiv.org/abs/2204.01587
+
+\bibitem{cityscapes}
+Cordts, M., Omran, M., Ramos, S., et al. The Cityscapes Dataset for Semantic Urban Scene Understanding. CVPR, 2016.
+
+\bibitem{foggy_zurich}
+Sakaridis, C., Dai, D., Van Gool, L. Semantic Foggy Scene Understanding with Synthetic Data. IJCV, 2018.
+
+\bibitem{foggy_driving}
+Sakaridis, C., Dai, D., Van Gool, L. Model Adaptation with Synthetic and Real Data for Semantic Dense Foggy Scene Understanding. ECCV, 2018.
+
+\bibitem{dann}
+Ganin, Y., Lempitsky, V. Unsupervised Domain Adaptation by Backpropagation. ICML, 2015.
+
+\bibitem{mean_teacher}
+Tarvainen, A., Valpola, H. Mean Teachers are Better Role Models: Weight-Averaged Consistency Targets Improve Semi-supervised Deep Learning Results. NeurIPS, 2017.
+
+\bibitem{fda}
+Yang, Y., Soatto, S. FDA: Fourier Domain Adaptation for Semantic Segmentation. CVPR, 2020.
+
+\bibitem{fixmatch}
+Sohn, K., Berthelot, D., Li, C.-L., et al. FixMatch: Simplifying Semi-Supervised Learning with Consistency and Confidence. NeurIPS, 2020.
+\end{thebibliography}
+
+\end{document}

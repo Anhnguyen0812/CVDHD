@@ -276,18 +276,6 @@ def main():
     enc_opt, dec_opt = optimisers[0], optimisers[1]
 
     scaler = amp.GradScaler(enabled=bool(args.amp))
-    save_full = bool(getattr(args, "save_full_checkpoint", False))
-    full_steps_raw = str(getattr(args, "save_full_at_steps", "") or "").strip()
-    full_steps: set[int] = set()
-    if full_steps_raw:
-        for part in full_steps_raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                full_steps.add(int(part))
-            except Exception:
-                pass
     pseudo_w = float(getattr(args, "pseudo_weight", 0.1))
     pseudo_every = int(getattr(args, "pseudo_every", 1) or 1)
     if pseudo_every < 1:
@@ -476,64 +464,18 @@ def main():
             save_every = int(args.save_pred_every)
 
         if i_iter % max(1, save_every) == 0 and i_iter != 0:
-            ckpt = {"state_dict": model.state_dict(), "train_iter": i_iter, "args": args}
-            if save_full:
-                ckpt.update(
-                    {
-                        "enc_opt": enc_opt.state_dict(),
-                        "dec_opt": dec_opt.state_dict(),
-                        "schedulers": [s.state_dict() for s in schedulers] if isinstance(schedulers, (list, tuple)) else None,
-                        "scaler": scaler.state_dict() if scaler is not None else None,
-                        "ema_state_dict": (ema_model.state_dict() if (use_fixmatch and ema_model is not None) else None),
-                    }
-                )
-            torch.save(ckpt, osp.join(snapshot_dir, run_name) + "_FIFO" + str(i_iter) + ".pth")
+            torch.save(
+                {"state_dict": model.state_dict(), "train_iter": i_iter, "args": args},
+                osp.join(snapshot_dir, run_name) + "_FIFO" + str(i_iter) + ".pth",
+            )
             print(f"[SELFTRAIN] snapshot saved: {run_name}_FIFO{i_iter}.pth", flush=True)
 
-            # Optionally save a full checkpoint at selected steps only.
-            if (not save_full) and (i_iter in full_steps):
-                ckpt_full = {"state_dict": model.state_dict(), "train_iter": i_iter, "args": args}
-                ckpt_full.update(
-                    {
-                        "enc_opt": enc_opt.state_dict(),
-                        "dec_opt": dec_opt.state_dict(),
-                        "schedulers": [s.state_dict() for s in schedulers] if isinstance(schedulers, (list, tuple)) else None,
-                        "scaler": scaler.state_dict() if scaler is not None else None,
-                        "ema_state_dict": (ema_model.state_dict() if (use_fixmatch and ema_model is not None) else None),
-                    }
-                )
-                torch.save(ckpt_full, osp.join(snapshot_dir, run_name) + "_FULL" + str(i_iter) + ".pth")
-                print(f"[SELFTRAIN] full snapshot saved: {run_name}_FULL{i_iter}.pth", flush=True)
-
         if i_iter >= int(args.num_steps_stop) - 1:
-            ckpt = {"state_dict": model.state_dict(), "train_iter": i_iter, "args": args}
-            if save_full:
-                ckpt.update(
-                    {
-                        "enc_opt": enc_opt.state_dict(),
-                        "dec_opt": dec_opt.state_dict(),
-                        "schedulers": [s.state_dict() for s in schedulers] if isinstance(schedulers, (list, tuple)) else None,
-                        "scaler": scaler.state_dict() if scaler is not None else None,
-                        "ema_state_dict": (ema_model.state_dict() if (use_fixmatch and ema_model is not None) else None),
-                    }
-                )
-            torch.save(ckpt, osp.join(snapshot_dir, args.file_name + str(args.num_steps_stop) + ".pth"))
+            torch.save(
+                {"state_dict": model.state_dict(), "train_iter": i_iter, "args": args},
+                osp.join(snapshot_dir, args.file_name + str(args.num_steps_stop) + ".pth"),
+            )
             print(f"[SELFTRAIN] final saved: {args.file_name}{args.num_steps_stop}.pth", flush=True)
-
-            # If user requested a full checkpoint at this stop step (and we are not in save_full mode), write it.
-            if (not save_full) and (int(args.num_steps_stop) in full_steps):
-                ckpt_full = {"state_dict": model.state_dict(), "train_iter": i_iter, "args": args}
-                ckpt_full.update(
-                    {
-                        "enc_opt": enc_opt.state_dict(),
-                        "dec_opt": dec_opt.state_dict(),
-                        "schedulers": [s.state_dict() for s in schedulers] if isinstance(schedulers, (list, tuple)) else None,
-                        "scaler": scaler.state_dict() if scaler is not None else None,
-                        "ema_state_dict": (ema_model.state_dict() if (use_fixmatch and ema_model is not None) else None),
-                    }
-                )
-                torch.save(ckpt_full, osp.join(snapshot_dir, args.file_name + str(args.num_steps_stop) + "_FULL.pth"))
-                print(f"[SELFTRAIN] full final saved: {args.file_name}{args.num_steps_stop}_FULL.pth", flush=True)
             break
 
     return 0

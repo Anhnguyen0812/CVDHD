@@ -91,12 +91,6 @@ def get_arguments():
     parser.add_argument("--save-pred-early-until", type=int, default=0,
                         help="If >0, apply --save-pred-every-early while i_iter < this step")
 
-    # Checkpoint format
-    parser.add_argument("--save-full-checkpoint", action="store_true",
-                        help="Save a full training checkpoint (model + optimizers + schedulers + AMP scaler + EMA teacher if enabled). Larger files.")
-    parser.add_argument("--save-full-at-steps", type=str, default="",
-                        help="Optional: save full checkpoints only at these iterations (comma-separated, e.g. '200,400,800'). Useful to keep FIFO snapshots light.")
-
     parser.add_argument("--freeze-bn", action="store_true",
                         help="Freeze BatchNorm running stats (set BN layers to eval) during training; useful for resume/finetune with small batch")
 
