@@ -262,16 +262,21 @@ def main():
                     fog_factor_cw[batch_idx] = fogpassfilter(vector_cw_gram[batch_idx])
                     fog_factor_rf[batch_idx] = fogpassfilter(vector_rf_gram[batch_idx])                                                                                                                                                                                                
 
-                fog_factor_embeddings = torch.cat((torch.unsqueeze(fog_factor_sf[0],0),torch.unsqueeze(fog_factor_cw[0],0),torch.unsqueeze(fog_factor_rf[0],0),
-                                                   torch.unsqueeze(fog_factor_sf[1],0),torch.unsqueeze(fog_factor_cw[1],0),torch.unsqueeze(fog_factor_rf[1],0),
-                                                   torch.unsqueeze(fog_factor_sf[2],0),torch.unsqueeze(fog_factor_cw[2],0),torch.unsqueeze(fog_factor_rf[2],0),
-                                                   torch.unsqueeze(fog_factor_sf[3],0),torch.unsqueeze(fog_factor_cw[3],0),torch.unsqueeze(fog_factor_rf[3],0)),0)
+                # Build embeddings dynamically (works for any batch size).
+                emb_list = []
+                for batch_idx in range(args.batch_size):
+                    emb_list.append(torch.unsqueeze(fog_factor_sf[batch_idx], 0))
+                    emb_list.append(torch.unsqueeze(fog_factor_cw[batch_idx], 0))
+                    emb_list.append(torch.unsqueeze(fog_factor_rf[batch_idx], 0))
+                fog_factor_embeddings = torch.cat(emb_list, dim=0)
 
-                fog_factor_embeddings_norm = torch.norm(fog_factor_embeddings, p=2, dim=1).detach()
-                size_fog_factor = fog_factor_embeddings.size()
-                fog_factor_embeddings = fog_factor_embeddings.div(fog_factor_embeddings_norm.expand(size_fog_factor[1],12).t())
-                fog_factor_labels = torch.LongTensor([0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2])
-                fog_pass_filter_loss = fogpassfilter_loss(fog_factor_embeddings,fog_factor_labels)
+                # L2 normalize per-embedding
+                fog_factor_embeddings = fog_factor_embeddings / torch.norm(
+                    fog_factor_embeddings, p=2, dim=1, keepdim=True
+                ).detach().clamp(min=1e-12)
+
+                fog_factor_labels = torch.LongTensor([0, 1, 2] * int(args.batch_size)).to(fog_factor_embeddings.device)
+                fog_pass_filter_loss = fogpassfilter_loss(fog_factor_embeddings, fog_factor_labels)
 
                 total_fpf_loss +=  fog_pass_filter_loss 
               
