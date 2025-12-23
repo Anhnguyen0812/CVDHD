@@ -425,12 +425,20 @@ def main():
             FogPassFilter1_optimizer.step()
             FogPassFilter2_optimizer.step()
 
-        if i_iter < 20000:
-            save_pred_every = 5000
-            if args.modeltrain=='train':
-                save_pred_every = 2000
+        # Snapshot interval
+        if int(getattr(args, "save_pred_every_early", 0) or 0) > 0 and int(getattr(args, "save_pred_early_until", 0) or 0) > 0:
+            if i_iter < int(getattr(args, "save_pred_early_until")):
+                save_pred_every = int(getattr(args, "save_pred_every_early"))
+            else:
+                save_pred_every = int(args.save_pred_every)
         else:
-            save_pred_every = args.save_pred_every
+            # Original heuristic from the authors
+            if i_iter < 20000:
+                save_pred_every = 5000
+                if args.modeltrain == 'train':
+                    save_pred_every = 2000
+            else:
+                save_pred_every = int(args.save_pred_every)
 
         if i_iter >= args.num_steps_stop - 1:
             print('save model ..')
