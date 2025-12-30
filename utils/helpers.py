@@ -22,7 +22,7 @@ def maybe_download(model_name, model_url, model_dir=None, map_location=None):
         url = model_url
         sys.stderr.write('Downloading: "{}" to {}\n'.format(url, cached_file))
         urllib.request.urlretrieve(url, cached_file)
-    return torch.load(cached_file, map_location=map_location)
+    return torch.load(cached_file, map_location=map_location, weights_only=False)
 
 
 def prepare_img(img):

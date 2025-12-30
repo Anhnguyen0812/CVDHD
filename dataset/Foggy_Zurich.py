@@ -39,11 +39,24 @@ class foggyzurichDataSet(data.Dataset):
     mean_rgb = {
         "cityscapes": [0.0, 0.0, 0.0],
     }
-    def __init__(self, root, list_path, max_iters=None, mean=(128, 128, 128), ignore_label=255, set='val'):
+    def __init__(
+        self,
+        root,
+        list_path,
+        max_iters=None,
+        mean=(128, 128, 128),
+        ignore_label=255,
+        set='val',
+        *,
+        pseudo_label_dir=None,
+        return_label: bool = False,
+    ):
         self.root = root
         self.list_path = list_path
         self.ignore_label = ignore_label
         self.mean = mean
+        self.pseudo_label_dir = pseudo_label_dir
+        self.return_label = bool(return_label)
         self.img_ids = [i_id.strip() for i_id in open(list_path)]
         if not max_iters==None:
             self.img_ids = self.img_ids * int(np.ceil(float(max_iters) / len(self.img_ids)))
@@ -99,7 +112,7 @@ class foggyzurichDataSet(data.Dataset):
         self.class_map = dict(zip(self.valid_classes, range(19)))
 
         for name in self.img_ids:
-            img_file = osp.join(self.root, "./Foggy_Zurich/%s" % (name))
+            img_file = osp.join(self.root, "foggy_zurich/Foggy_Zurich/%s" % (name))
             self.files.append({
                 "img": img_file,
                 "name": name
@@ -113,19 +126,34 @@ class foggyzurichDataSet(data.Dataset):
       
 
         image = Image.open(datafiles["img"]).convert('RGB')
+        label = None
+        if self.return_label:
+            if not self.pseudo_label_dir:
+                raise ValueError("return_label=True requires pseudo_label_dir to be set")
+            lbl_path = osp.join(self.pseudo_label_dir, datafiles["name"])
+            if not osp.exists(lbl_path):
+                raise FileNotFoundError(f"Pseudo label not found: {lbl_path}")
+            label = Image.open(lbl_path)
         
         name = datafiles["name"]
 
         # resize
         w, h = image.size
-        image = self._apply_transform(image, scale=0.8)
+        if label is None:
+            image = self._apply_transform(image, scale=0.8)
+        else:
+            image, label = self._apply_transform_pair(image, label, scale=0.8)
         
         crop_size = min(600, min(image.size[:2]))
         i, j, h, w = transforms.RandomCrop.get_params(image, output_size=(crop_size,crop_size)) 
         image = TF.crop(image, i, j, h, w) 
+        if label is not None:
+            label = TF.crop(label, i, j, h, w)
 
         if random.random() > 0.5:
             image = TF.hflip(image)
+            if label is not None:
+                label = TF.hflip(label)
 
         image = np.asarray(image, np.float32)
 
@@ -134,8 +162,11 @@ class foggyzurichDataSet(data.Dataset):
         image -= self.mean
         image = image.transpose((2, 0, 1))
 
+        if label is None:
+            return image.copy(), np.array(size), name
 
-        return image.copy(), np.array(size), name
+        label = np.array(label, dtype=np.uint8)
+        return image.copy(), label.copy(), np.array(size), name
     
     def encode_segmap(self, mask):
         # Put all void classes to zero
@@ -155,6 +186,15 @@ class foggyzurichDataSet(data.Dataset):
         tsfrms = transforms.Compose(tsfrms)
 
         return tsfrms(img)
+
+    def _apply_transform_pair(self, img, lbl, scale=(0.7, 1.3), crop_size=600):
+        (W, H) = img.size[:2]
+        if isinstance(scale, tuple):
+            scale = random.random() * 0.6 + 0.7
+
+        img_tsfrms = transforms.Compose([transforms.Resize((int(H * scale), int(W * scale)))])
+        lbl_tsfrms = transforms.Compose([transforms.Resize((int(H * scale), int(W * scale)), interpolation=Image.NEAREST)])
+        return img_tsfrms(img), lbl_tsfrms(lbl)
 
 if __name__ == '__main__':
     dst = foggyzurichDataSet("./data", is_transform=True)

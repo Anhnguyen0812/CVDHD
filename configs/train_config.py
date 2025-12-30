@@ -6,14 +6,14 @@ BETA = 0.005
 BATCH_SIZE = 4
 ITER_SIZE = 1
 NUM_WORKERS = 4
-DATA_DIRECTORY ='/root/data1'
-DATA_LIST_PATH = f'./dataset/cityscapes_list/train_foggy_{BETA}.txt'
-DATA_CITY_PATH = './dataset/cityscapes_list/clear_lindau.txt'
+DATA_DIRECTORY ='/kaggle/input/fifo-dataset'
+DATA_LIST_PATH = f'/kaggle/working/CVDHD/dataset/cityscapes_list/train_foggy_{BETA}.txt'
+DATA_CITY_PATH = '/kaggle/working/CVDHD/dataset/cityscapes_list/clear_lindau.txt'
 INPUT_SIZE = '2048,1024'
-DATA_DIRECTORY_CWSF = '/root/data1/Cityscapes'
-DATA_LIST_PATH_CWSF = './dataset/cityscapes_list/train_origin.txt'
-DATA_LIST_RF = '/root/data1/Foggy_Zurich/lists_file_names/RGB_sum_filenames.txt'
-DATA_DIR = '/root/data1'
+DATA_DIRECTORY_CWSF = '/kaggle/input/fifo-dataset'
+DATA_LIST_PATH_CWSF = '/kaggle/working/CVDHD/dataset/cityscapes_list/train_origin.txt'
+DATA_LIST_RF = '/kaggle/input/fifo-dataset/foggy_zurich/Foggy_Zurich/lists_file_names/RGB_light_filenames.txt'
+DATA_DIR = '/kaggle/input/fifo-dataset'
 INPUT_SIZE_RF = '1920,1080'
 NUM_CLASSES = 19 
 NUM_STEPS = 100000 
@@ -22,7 +22,10 @@ RANDOM_SEED = 1234
 RESTORE_FROM = 'no_model'
 RESTORE_FROM_fogpass = 'no_model'
 SAVE_PRED_EVERY = 100
-SNAPSHOT_DIR = f'/root/data1/snapshots/FIFO_model'   
+SNAPSHOT_DIR = f'./snapshots/FIFO_model'
+# If set, this overrides --snapshot-dir in the training entrypoints.
+# Default to empty to avoid hard-coding Kaggle-only paths.
+SAVE_DIR = ''
 
 SET = 'train'
 
@@ -49,13 +52,117 @@ def get_arguments():
     parser.add_argument("--restore-from", type=str, default=RESTORE_FROM)
     parser.add_argument("--restore-from-fogpass", type=str, default=RESTORE_FROM_fogpass)
     parser.add_argument("--save-pred-every", type=int, default=SAVE_PRED_EVERY)
+    parser.add_argument("--log-every", type=int, default=50,
+                        help="Print a short training progress line every N iterations (0 disables)")
     parser.add_argument("--snapshot-dir", type=str, default=SNAPSHOT_DIR)
+    parser.add_argument("--save-dir", type=str, default=SAVE_DIR)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--set", type=str, default=SET)
     parser.add_argument("--lambda-fsm", type=float, default=0.0000001)
     parser.add_argument("--lambda-con", type=float, default=0.0001)
+    parser.add_argument("--lambda-cl", type=float, default=0.01,
+                        help="Weight for image-level contrastive loss (SimCLR/NT-Xent) between paired domains")
+    parser.add_argument("--cl-temp", type=float, default=0.1,
+                        help="Temperature for contrastive loss")
+    parser.add_argument("--cl-warmup-steps", type=int, default=1000,
+                        help="Linearly ramp contrastive loss weight over this many steps")
+    parser.add_argument("--finetune", action="store_true",
+                        help="Enable gentle-backbone / strong-new-head finetuning settings when resuming")
+    parser.add_argument("--backbone-lr-mult", type=float, default=0.1,
+                        help="Multiplier for encoder/backbone LR when --finetune is set")
+    parser.add_argument("--head-lr-mult", type=float, default=0.5,
+                        help="Multiplier for decoder/head LR when --finetune is set")
+    parser.add_argument("--cl-head-lr", type=float, default=1e-3,
+                        help="Learning rate for the contrastive projection head")
+
+    # Diagnostics / stability knobs for resume-finetune
+    parser.add_argument("--freeze-fogpass-steps", type=int, default=0,
+                        help="If >0, do not update FogPassFilter modules for the first N training steps")
+    parser.add_argument("--fpf1-lr", type=float, default=None,
+                        help="Override learning rate for FogPassFilter1 (Adamax). If not set, uses the built-in defaults")
+    parser.add_argument("--fpf2-lr", type=float, default=None,
+                        help="Override learning rate for FogPassFilter2 (Adamax). If not set, uses the built-in defaults")
+    parser.add_argument("--fpf-lr-mult", type=float, default=1.0,
+                        help="Multiplier applied to FogPassFilter lrs (useful when resuming/finetuning)")
+
+    # Snapshot frequency controls (useful for quick early-step debugging)
+    parser.add_argument("--save-pred-every-early", type=int, default=0,
+                        help="If >0, override snapshot interval for early steps")
+    parser.add_argument("--save-pred-early-until", type=int, default=0,
+                        help="If >0, apply --save-pred-every-early while i_iter < this step")
+
+    parser.add_argument("--freeze-bn", action="store_true",
+                        help="Freeze BatchNorm running stats (set BN layers to eval) during training; useful for resume/finetune with small batch")
+
+    # Self-training / pseudo-label knobs (used by main_selftrain.py)
+    parser.add_argument("--pseudo-label-dir", type=str, default="",
+                        help="Directory containing pseudo labels for Foggy Zurich train images (same relative paths as entries in --data-list-rf)")
+    parser.add_argument("--pseudo-weight", type=float, default=0.1,
+                        help="Weight for pseudo-label loss on target images")
+    parser.add_argument("--pseudo-every", type=int, default=1,
+                        help="Self-train: apply target pseudo-label loss every N iterations (1 = every iter). Use >1 to reduce negative transfer.")
+
+    # FixMatch / UniMatch-lite (EMA teacher + weak->strong consistency)
+    parser.add_argument("--fixmatch", action="store_true",
+                        help="Enable FixMatch-style self-training: EMA teacher predicts pseudo labels on weak target, student learns on strong target with confidence mask.")
+    parser.add_argument("--ema-decay", type=float, default=0.99,
+                        help="EMA decay for teacher update (typical 0.99-0.999).")
+    parser.add_argument("--pseudo-threshold", type=float, default=0.95,
+                        help="Confidence threshold for pseudo labels (FixMatch). Low-confidence pixels are ignored.")
+    parser.add_argument("--pseudo-threshold-start", type=float, default=-1.0,
+                        help="FixMatch: optional threshold schedule start value (e.g. 0.99). Set <0 to disable scheduling.")
+    parser.add_argument("--pseudo-threshold-end", type=float, default=-1.0,
+                        help="FixMatch: optional threshold schedule end value (e.g. 0.98). Set <0 to disable scheduling.")
+    parser.add_argument("--pseudo-threshold-ramp", type=int, default=0,
+                        help="FixMatch: linearly ramp threshold from start->end over this many steps. 0 disables.")
+
+    parser.add_argument("--consistency-weight", type=float, default=0.0,
+                        help="FixMatch: weight for teacher-student consistency loss on target logits (0 disables).")
+    parser.add_argument("--consistency-type", type=str, default="kl", choices=["kl", "mse"],
+                        help="FixMatch: consistency loss type between teacher and student probabilities.")
+    parser.add_argument("--consistency-temp", type=float, default=1.0,
+                        help="FixMatch: distillation temperature for consistency loss.")
+    parser.add_argument("--strong-brightness", type=float, default=0.2,
+                        help="Strong aug: brightness jitter range (0 disables).")
+    parser.add_argument("--strong-contrast", type=float, default=0.2,
+                        help="Strong aug: contrast jitter range (0 disables).")
+    parser.add_argument("--strong-saturation", type=float, default=0.2,
+                        help="Strong aug: saturation jitter range (0 disables).")
+    parser.add_argument("--strong-noise-std", type=float, default=0.02,
+                        help="Strong aug: Gaussian noise std in [0,1] space (0 disables).")
+    parser.add_argument("--strong-cutout", type=float, default=0.5,
+                        help="Strong aug: cutout size ratio relative to min(H,W) (0 disables).")
+    parser.add_argument("--strong-blur", type=int, default=1,
+                        help="Strong aug: enable simple blur (1=on,0=off).")
+
+    # Experiment knobs (optional; only used by specific main_*.py entrypoints)
+    parser.add_argument("--fda-beta", type=float, default=0.01,
+                        help="FDA: fraction of low-frequency spectrum to swap (typical 0.005-0.05)")
+
+    parser.add_argument("--boundary-lr", type=float, default=1e-3,
+                        help="BoundaryHead: learning rate")
+    parser.add_argument("--boundary-warmup-steps", type=int, default=1000,
+                        help="BoundaryHead: steps to train boundary head before joint finetune")
+    parser.add_argument("--boundary-weight", type=float, default=0.5,
+                        help="BoundaryHead: loss weight for boundary prediction")
+
+    parser.add_argument("--proto-head-lr", type=float, default=1e-3,
+                        help="ProtoCL: projection head learning rate")
+    parser.add_argument("--proto-weight", type=float, default=0.1,
+                        help="ProtoCL: loss weight")
+    parser.add_argument("--proto-temp", type=float, default=0.1,
+                        help="ProtoCL: softmax temperature")
+    parser.add_argument("--proto-momentum", type=float, default=0.99,
+                        help="ProtoCL: EMA momentum for prototype update")
+    parser.add_argument("--proto-init-iters", type=int, default=200,
+                        help="ProtoCL: number of labeled-source iters for prototype initialization")
+    parser.add_argument("--proto-sample-pixels", type=int, default=4096,
+                        help="ProtoCL: max pixels sampled per init iter")
     parser.add_argument("--file-name", type=str, required=True)
     parser.add_argument("--modeltrain", type=str, required=True)
+    parser.add_argument("--distributed", action="store_true")
+    parser.add_argument("--local-rank", type=int, default=0)
+    parser.add_argument("--amp", type=int, default=1)
     return parser.parse_args()
 
 args = get_arguments()

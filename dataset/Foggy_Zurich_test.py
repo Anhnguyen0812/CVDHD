@@ -10,7 +10,7 @@ from torch.utils import data
 from PIL import Image
 from os.path import join
 import json
-import scipy.misc as m
+import numpy as np
 
 class foggyzurichDataSet(data.Dataset):
     colors = [  # [  0,   0,   0],
@@ -109,8 +109,9 @@ class foggyzurichDataSet(data.Dataset):
         datafiles = self.files[index]
       
         image = Image.open(datafiles["img"]).convert('RGB')
-        label = m.imread(datafiles["label"])
-        label = np.array(label, dtype=np.float32)
+        # scipy.misc.imread/imresize are removed in recent SciPy versions (e.g., Kaggle).
+        # Use PIL for robust PNG loading.
+        label = np.array(Image.open(datafiles["label"]), dtype=np.int32)
         name = datafiles["name"]
 
         # resize
@@ -119,10 +120,11 @@ class foggyzurichDataSet(data.Dataset):
         image = image.resize(self.crop_size, Image.BICUBIC)
         image = np.asarray(image, np.float32)
 
-        classes = np.unique(label)
-        lbl = label.astype(float)
-        lbl = m.imresize(label, (self.crop_size[1], self.crop_size[0]), "nearest", mode="F")
-        label = lbl.astype(int)
+        # Resize label with nearest-neighbor to preserve trainId values.
+        label = np.array(
+            Image.fromarray(label.astype(np.uint8)).resize(self.crop_size, resample=Image.NEAREST),
+            dtype=np.int32,
+        )
 
         size = image.shape
         image = image[:, :, ::-1]  # change to BGR

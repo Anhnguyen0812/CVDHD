@@ -22,14 +22,25 @@ class CrossEntropy2d(nn.Module):
         assert not target.requires_grad
         assert predict.dim() == 4
         assert target.dim() == 3
-        n, c, h, w = predict.size() 
-        n1, h1, w1 = target.size() 
-        target_mask = (target >= 0) * (target != self.ignore_label)
-        target = target[target_mask]
-        if not target.data.dim():
-            return Variable(torch.zeros(1))
-        predict = predict.transpose(1, 2).transpose(2, 3).contiguous()
-        predict = predict[target_mask.view(n, h, w, 1).repeat(1, 1, 1, c)].view(-1, c)
-        loss = F.cross_entropy(predict, target, weight=weight, size_average=self.size_average)
-        return loss
+
+        n, c, h, w = predict.size()
+        n1, h1, w1 = target.size()
+        assert n == n1 and h == h1 and w == w1
+
+        # Build valid mask (ignore_label filtered). Use boolean mask to avoid
+        # allocating an (N,H,W,C) repeated tensor which can OOM at high res.
+        valid_mask = (target != self.ignore_label)
+        target_flat = target.view(-1)
+        mask_flat = valid_mask.view(-1)
+        target_sel = target_flat[mask_flat]
+        if target_sel.numel() == 0:
+            return predict.sum() * 0.0
+
+        # (N,C,H,W) -> (N*H*W, C)
+        predict_flat = predict.permute(0, 2, 3, 1).contiguous().view(-1, c)
+        predict_sel = predict_flat[mask_flat]
+
+        # Use modern reduction argument; keep original semantics.
+        reduction = "mean" if self.size_average else "sum"
+        return F.cross_entropy(predict_sel, target_sel, weight=weight, reduction=reduction)
 

@@ -87,7 +87,7 @@ def compute_mIoU(gt_dir, pred_dir, devkit_dir, dataset):
     [-1, 255]]    
 
     num_classes = 19
-    name_classes = np.array(label, dtype=np.str)
+    name_classes = np.array(label, dtype=str)
 
     hist = np.zeros((num_classes, num_classes))
     if 'FZ' in dataset:
@@ -106,7 +106,7 @@ def compute_mIoU(gt_dir, pred_dir, devkit_dir, dataset):
     gt_imgs = [join(gt_dir, x) for x in gt_imgs]
 
     if not 'FZ' in dataset:
-        mapping = np.array(label2train, dtype=np.int)
+        mapping = np.array(label2train, dtype=int)
     pred_imgs = open(image_path_list, 'r').read().splitlines()
     pred_imgs = [join(pred_dir, x.split('/')[-1]) for x in pred_imgs]
 

@@ -1,0 +1,256 @@
+﻿\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\\title{Improving Foggy Scene Segmentation via Teacher--Student Self-Training\\
+\\title{Improving Foggy Scene Segmentation via Teacher--Student Self-Training\\
+\large FixMatch/UniMatch-lite with EMA Teacher and Confidence-Thresholded Pseudo-Labels}
+\author{(Student name)\\(Course / class)}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Outdoor semantic segmentation under fog suffers from a strong \emph{domain shift} between the source domain (clear weather, labeled) and the target domain (foggy weather, typically unlabeled), causing a substantial mIoU drop at deployment. This report focuses on a simple Teacher--Student self-training approach inspired by FixMatch/UniMatch-lite: an EMA teacher generates pseudo-labels on \emph{weak} views, and the student is trained on \emph{strong} views using pixel-wise confidence thresholding to filter unreliable pseudo-labels. We evaluate on Foggy Zurich and Foggy Driving, and also report performance on a clear control set (Lindau) to monitor \emph{negative transfer}.
+\end{abstract}
+
+\section{Introduction}
+Semantic segmentation is a core component in perception systems for autonomous driving and driver assistance because it provides pixel-level scene understanding. However, segmentation models are often trained on \emph{clear} images with good visibility, while real deployments may encounter fog, rain, low light, or sensor noise. The resulting domain shift can severely degrade performance. In foggy conditions, reduced contrast and light scattering blur object boundaries and destabilize visual features. Therefore, domain adaptation and/or self-training on unlabeled target data are important directions to improve robustness.
+
+FIFO is a strong baseline for foggy segmentation that leverages fog-related filtering and auxiliary objectives \cite{fifo}. In practice, however, long fine-tuning and checkpoint choice can significantly affect the final mIoU. Moreover, two common risks arise: (i) \textbf{noisy pseudo-labels and confirmation bias} when self-training with low-quality pseudo-labels; and (ii) \textbf{negative transfer} that degrades performance on clear images as the model over-specializes to fog.
+
+\paragraph{Contributions.} This report makes two contributions: (C1) a Teacher--Student pipeline following FixMatch/UniMatch-lite (EMA teacher, weak$\to$strong, thresholded pseudo-labels) for foggy semantic segmentation \cite{fixmatch,unimatch}; (C2) pixel-wise confidence masking (via an ignore label) to filter unreliable pseudo-labels and mitigate confirmation bias.
+
+\paragraph{Paper organization.} Section~\ref{sec:background} reviews background. Section~\ref{sec:method} describes the proposed method. Section~\ref{sec:experiments} reports the experimental setup and research questions. Section~\ref{sec:discussion} discusses results and threats to validity. Section~\ref{sec:relatedwork} summarizes related work. Section~\ref{sec:conclusion} concludes.
+
+\section{Background}
+\label{sec:background}
+\subsection{Semantic segmentation and mIoU}
+Semantic segmentation predicts a class label for each pixel. A common metric is mean Intersection-over-Union (mIoU). For each class $k$:
+\begin{equation}
+\mathrm{IoU}_k = \frac{\mathrm{TP}_k}{\mathrm{TP}_k + \mathrm{FP}_k + \mathrm{FN}_k},
+\qquad
+\mathrm{mIoU} = \frac{1}{K}\sum_{k=1}^{K}\mathrm{IoU}_k.
+\end{equation}
+
+\subsection{Cross-entropy (CE)}
+Given logits $z$ and probabilities $p = \mathrm{softmax}(z)$ with ground-truth label $y$:
+\begin{equation}
+\mathrm{CE}(p,y) = -\log(p_y).
+\end{equation}
+In segmentation, CE is computed per pixel and averaged over valid pixels; an \emph{ignore label} is commonly used to exclude certain pixels from the loss.
+
+\subsection{Teacher--Student self-training, EMA, and confidence thresholding}
+Teacher--Student self-training uses a teacher to generate pseudo-labels on unlabeled data and trains the student to match them. The EMA teacher is updated from the student:
+\begin{equation}
+\phi \leftarrow \alpha\phi + (1-\alpha)\theta,
+\end{equation}
+where $\alpha\in[0,1)$ is the EMA decay.
+
+\section{Proposed Method}
+\label{sec:method}
+\subsection{Notation and inputs/outputs}
+Notation: student $f_\theta$, teacher $f_\phi$; labeled source data $(x_s, y_s)$; unlabeled target data $x_t$; weak augmentation $a_w(\cdot)$; strong augmentation $a_s(\cdot)$; pixel-wise pseudo-label $\hat{y}$; confidence mask $m$; threshold $\tau$.
+
+Inputs: (i) a labeled source set (paired Cityscapes SF/CW), (ii) an unlabeled foggy target set (Foggy Zurich / Foggy Driving), (iii) a segmentation backbone (RefineNet-LW101 as in FIFO) and hyper-parameters. Outputs: the best student checkpoint according to the foggy objective under the Lindau constraint, along with the corresponding EMA teacher.
+
+\subsection{Pipeline overview}
+The proposed method uses two parallel training streams: \textbf{(1) a supervised source stream} to retain core knowledge; and \textbf{(2) a target self-training stream} to adapt to fog.
+
+At each iteration:
+\begin{enumerate}
+	\item Sample a labeled source minibatch $(x_s, y_s)$ and an unlabeled target minibatch $x_t$.
+	\item Create views: $x_{t,w} = a_w(x_t)$ and $x_{t,s} = a_s(x_t)$.
+	\item Run the EMA teacher on $x_{t,w}$ to produce $\hat{y}$ and confidence mask $m$ under threshold $\tau$.
+	\item Update the student by optimizing the combined source and target losses.
+	\item Update the EMA teacher.
+\end{enumerate}
+
+\subsection{Source stream: supervised loss}
+The student predicts $p_s(x_s)$ and optimizes:
+\begin{equation}
+L_{src} = \mathrm{CE}(p_s(x_s), y_s).
+\end{equation}
+The source stream helps prevent \emph{catastrophic forgetting} and stabilizes training.
+
+\subsection{Target stream: FixMatch/UniMatch-lite with pixel-wise pseudo-labels}
+The teacher predicts a distribution $p_t(x_{t,w})$. For each pixel, we compute a pseudo-label and its confidence:
+\begin{equation}
+\hat{y} = \arg\max_c p_t^c,\qquad c^* = \max_c p_t^c,
+\end{equation}
+confidence mask:
+\begin{equation}
+m = \mathbf{1}[c^* \ge \tau].
+\end{equation}
+The student is trained on the strong view $x_{t,s}$:
+\begin{equation}
+L_{tgt} = \frac{1}{\sum m}\sum m\cdot \mathrm{CE}(p_s(x_{t,s}), \hat{y}).
+\end{equation}
+In implementation, pixels with $m=0$ are assigned an \texttt{ignore\_label} (e.g., 255) so they are excluded from CE averaging.
+
+\paragraph{Consistency loss (optional).} If enabled, we add KL/MSE consistency between teacher and student distributions (only on confident pixels):
+\begin{equation}
+L_{con} = \frac{T^2}{\sum m}\sum m\cdot \mathrm{KL}(p_t(x_{t,w})\,\|\,p_s(x_{t,s})).
+\end{equation}
+
+\subsection{Overall objective}
+\begin{equation}
+L = L_{src} + \lambda_{pl}L_{tgt} + \lambda_{con}L_{con}.
+\end{equation}
+
+\subsection{Monitoring negative transfer (reporting only)}
+To monitor potential performance degradation on clear-weather images, we also report mIoU on a clear control set (Lindau). We define:
+\begin{equation}
+\Delta\mathrm{Lindau} = \mathrm{mIoU}_{\mathrm{Lindau}}^{(ours)} - \mathrm{mIoU}_{\mathrm{Lindau}}^{(baseline)}.
+\end{equation}
+
+\section{Experimental Results}
+\label{sec:experiments}
+
+\subsection{Datasets, baseline, and metric}
+Foggy sets: Foggy Zurich (FZ) \cite{foggyzurich}, Foggy Driving Dense (FDD) and Foggy Driving (FD) \cite{foggydriving}. Clear control set: Lindau. Baseline: the provided FIFO final checkpoint \cite{fifo}. Main metric: mean Intersection-over-Union (mIoU), following the Cityscapes evaluation protocol \cite{cityscapes}.
+
+\subsection{Training configuration}
+We follow the Teacher--Student setup in Section~\ref{sec:method}. The student network uses the same RefineNet-LW101 architecture as FIFO (RefineNet-style refinement) \cite{fifo,refinenet}. We fine-tune from the FIFO final checkpoint with a conservative setting (SAFE recipe) to avoid unstable drift when using small batch size. In our short experiments, we used batch size 1 with gradient accumulation (iter-size 4), and evaluated intermediate checkpoints at a fixed snapshot interval. Unless otherwise stated, we use an EMA teacher ($\alpha$ close to 1), confidence threshold $\tau$ for pseudo-label masking, and optional consistency loss between teacher and student.
+
+\subsection{Research questions}
+\begin{itemize}
+	\item \textbf{RQ1 (Performance, required):} How much does the proposed method improve foggy mIoU over the FIFO baseline, and does it satisfy the Lindau drop constraint $\le 0.2$?
+	\item \textbf{RQ2:} How do $\tau$ (and scheduling, if used) affect the selected-pixel ratio and mIoU?
+	\item \textbf{RQ3 (Ablation):} What is the contribution of EMA, threshold scheduling, consistency loss, and the source branch?
+	\item \textbf{RQ4 (Resources, required):} What is the runtime/VRAM overhead compared to the baseline?
+\end{itemize}
+
+\subsection{Answer to RQ1: Overall performance (template)}
+\paragraph{Overview.} We compare the FIFO baseline checkpoint to our final Teacher--Student self-training run. We prioritize foggy performance (FZ/FDD/FD) but also check Lindau to make sure the method does not harm clear-weather segmentation.
+
+\paragraph{Overall results.} Starting from the final FIFO baseline checkpoint, Teacher--Student self-training consistently improves all foggy benchmarks while preserving clear-domain performance. In our final run, we improve mIoU by +1.29 on Foggy Zurich (FZ), +0.82 on Foggy Driving Dense (FDD), and +0.28 on Foggy Driving (FD), while Lindau also increases by +0.24 (Table~\ref{tab:main}). Therefore, the negative-transfer constraint is satisfied ($\Delta\mathrm{Lindau} \ge -0.2$).
+
+\begin{table}[t]
+\centering
+\caption{Comparison between the FIFO baseline and the proposed Teacher--Student self-training (mIoU, higher is better).}
+\label{tab:main}
+\begin{tabular}{lcccc}
+									\\toprule
+									\\textbf{Method} & \textbf{FZ} & \textbf{FDD} & \textbf{FD} & \textbf{Lindau}\\
+\midrule
+Baseline (FIFO, final) & 48.41 & 48.93 & 50.71 & 64.75 \\
+Ours (final run) & 49.70 & 49.75 & 50.99 & 64.99 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings/insights.}
+\begin{itemize}
+	\item The biggest gains are on foggy benchmarks: +1.29 (FZ), +0.82 (FDD), +0.28 (FD) mIoU.
+	\item Clear-weather performance does not drop; Lindau slightly improves by +0.24 mIoU, so negative transfer is not observed in this run.
+	\item Using confidence masking and (optionally) consistency helps stabilize pseudo-label learning in early fine-tuning.
+\end{itemize}
+
+\paragraph{Bad cases.} Briefly describe 1--2 remaining failure modes (small/far objects, blurred boundaries, rare classes). If available, add a qualitative figure (input/GT/baseline/proposed).
+
+\paragraph{Finding box.} \textbf{[Finding--RQ1]} Teacher--Student self-training improves foggy mIoU over the FIFO baseline while satisfying the negative-transfer constraint ($\Delta\mathrm{Lindau}\ge -0.2$).
+
+\subsection{Answer to RQ2: Effect of $\tau$ and scheduling (template)}
+In this report we mainly used a fixed confidence threshold $\tau$ for pseudo-label masking. A more detailed study of threshold scheduling (e.g., start high and slowly decrease) is left for future work; it would require logging the selected-pixel ratio over time and comparing performance stability.
+
+\subsection{Answer to RQ3: Ablation study (template)}
+We ablate key components of the Teacher--Student design while keeping the SAFE fine-tuning recipe fixed. We report the best SAFE checkpoint at 500 steps for each setting.
+\begin{table}[t]
+\centering
+\caption{Ablation study on Teacher--Student self-training (best SAFE checkpoint at 500 steps, mIoU).}
+\label{tab:ablation}
+\begin{tabular}{lcccc}
+						\\toprule
+						\\textbf{Setting} & \textbf{FZ} & \textbf{FDD} & \textbf{FD} & \textbf{Lindau}\\
+\midrule
+(A0) Baseline (FIFO, final) & 48.41 & 48.93 & 50.71 & 64.75\\
+(A1) FixMatch (FM\_full) & 48.75 & 49.08 & 50.81 & 64.90\\
+(A2) FixMatch w/o EMA (noEMA) & 48.75 & 49.08 & 50.81 & 64.91\\
+(A3) FixMatch w/o threshold mask (noThrMask) & 48.75 & 49.11 & 50.82 & 64.90\\
+(A4) FixMatch + consistency (plusCons) & 49.01 & 49.49 & 50.97 & 64.83\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Ablation summary.} Consistency loss gives the largest improvement (+0.56 on FDD and +0.60 on FZ over baseline in this controlled run). In contrast, removing EMA has almost no effect in this SAFE setting, and removing the threshold mask changes results only slightly. This suggests that, under conservative fine-tuning, the main benefit comes from regularizing the student with teacher probabilities.
+
+\subsection{Answer to RQ4: Resource usage (required, template)}
+Teacher--Student self-training adds extra compute compared to the baseline fine-tuning because it requires an additional forward pass of the EMA teacher on the weak view (and sometimes extra loss terms). Memory usage also increases slightly due to storing teacher outputs for consistency. In our setup we did not record exact runtime/VRAM numbers, but the overhead mainly comes from the extra teacher forward pass and the strong augmentation pipeline.
+
+\section{Discussion and Threats to Validity}
+\label{sec:discussion}
+\subsection{Discussion}
+The proposed method improves foggy performance by (i) learning pseudo-labels only from confident pixels, (ii) using strong augmentation to increase robustness, and (iii) stabilizing training via a Teacher--Student design (EMA teacher) and optional consistency regularization. The supervised source branch acts as an anchor to reduce forgetting and helps control negative transfer.
+
+In practice, we found that using a conservative fine-tuning recipe is important for short runs: if the learning rate is too high, the model can drift and mIoU can drop quickly even in a few hundred steps. With SAFE fine-tuning, the scores increased steadily with more steps.
+
+\subsection{Threats to Validity}
+\paragraph{Internal validity.} Results may be sensitive to hyper-parameters ($\tau$, $\alpha$, $\lambda$), snapshot frequency, and random seeds. Comparisons should ensure the baseline and our method follow consistent evaluation protocols.
+
+\paragraph{External validity.} Conclusions on fog may not generalize to rain/night; results may change with different backbones or foggy datasets with different biases.
+
+\paragraph{Construct validity.} mIoU can hide behavior on rare classes; consider reporting per-class IoU or a subset of difficult classes if available.
+
+\section{Related Work}
+\label{sec:relatedwork}
+Related approaches can be grouped into three directions: (1) domain adaptation for segmentation (feature/output alignment), (2) self-training and pseudo-labeling, and (3) teacher--student methods with EMA combined with weak/strong augmentation. Domain adaptation reduces distribution gaps but may be insufficient under heavy fog where signals are strongly distorted. Self-training directly leverages target data but is prone to confirmation bias; thus confidence filtering and EMA teachers are often used to stabilize pseudo-labels. This report positions the proposed method as a practical end-to-end pipeline: pixel-wise self-training with confidence masking and an EMA teacher, a supervised source anchor to reduce negative transfer, and an optional teacher--student consistency term.
+
+\section{Conclusion}
+\label{sec:conclusion}
+This report proposes an improvement over FIFO by adding FixMatch/UniMatch-lite self-training with an EMA teacher, confidence-thresholded pseudo-labels, and an optional teacher--student consistency loss. Experimental results suggest improved foggy mIoU while controlling negative transfer. Future work includes (i) stronger spatial augmentations (flip/crop), (ii) adaptive thresholds based on entropy, and (iii) tighter integration with FIFO's fog-pass filtering into a unified pipeline.
+
+\begin{thebibliography}{10}
+\bibitem{fifo}
+Sohyun Lee, Taeyoung Son, and Suha Kwak.
+\newblock FIFO: Learning Fog-invariant Features for Foggy Scene Segmentation.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2022.
+\newblock \url{https://arxiv.org/abs/2204.01587}.
+
+\bibitem{fixmatch}
+Kihyuk Sohn, David Berthelot, Chun-Liang Li, Zizhao Zhang, Nicholas Carlini, Ekin D. Cubuk, Alex Kurakin, Han Zhang, and Colin Raffel.
+\newblock FixMatch: Simplifying Semi-Supervised Learning with Consistency and Confidence.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2020.
+\newblock \url{https://arxiv.org/abs/2001.07685}.
+
+\bibitem{unimatch}
+Lihe Yang, Lei Qi, Litong Feng, Wayne Zhang, and Yinghuan Shi.
+\newblock Revisiting Weak-to-Strong Consistency in Semi-Supervised Semantic Segmentation.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2023.
+\newblock \url{https://arxiv.org/abs/2208.09910}.
+
+\bibitem{cityscapes}
+Marius Cordts, Mohamed Omran, Sebastian Ramos, Timo Rehfeld, Markus Enzweiler, Rodrigo Benenson, Uwe Franke, Stefan Roth, and Bernt Schiele.
+\newblock The Cityscapes Dataset for Semantic Urban Scene Understanding.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, 2016.
+\newblock \url{https://arxiv.org/abs/1604.01685}.
+
+\bibitem{foggyzurich}
+Christos Sakaridis, Dengxin Dai, Simon Hecker, and Luc Van Gool.
+\newblock Model Adaptation with Synthetic and Real Data for Semantic Dense Foggy Scene Understanding.
+\newblock In \emph{Proceedings of the European Conference on Computer Vision (ECCV)}, 2018.
+\newblock \url{https://arxiv.org/abs/1808.01265}.
+
+\bibitem{foggydriving}
+Christos Sakaridis, Dengxin Dai, and Luc Van Gool.
+\newblock Semantic Foggy Scene Understanding with Synthetic Data.
+\newblock \emph{International Journal of Computer Vision (IJCV)}, 2018.
+\newblock \url{https://arxiv.org/abs/1708.07819}.
+
+\bibitem{refinenet}
+Guosheng Lin, Anton Milan, Chunhua Shen, and Ian D. Reid.
+\newblock RefineNet: Multi-Path Refinement Networks for High-Resolution Semantic Segmentation.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, 2017.
+\newblock \url{https://arxiv.org/abs/1611.06612}.
+\end{thebibliography}
+
+\end{document}
+
