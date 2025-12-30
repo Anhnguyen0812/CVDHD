@@ -1,12 +1,32 @@
-# FIFO: Learning Fog-invariant Features for Foggy Scene Segmentation
+# FIFO Improvement Project (Teacher--Student Self-Training)
 
-### [Project Page](http://cvlab.postech.ac.kr/research/FIFO/) | [Paper](https://arxiv.org/abs/2204.01587)
-This repo is the official implementation of [**CVPR 2022 Oral, Best Paper Finalist**] paper: "[**FIFO**: Learning Fog-invariant Features for Foggy Scene Segmentation](https://arxiv.org/abs/2204.01587)".
+This workspace is a **course/project improvement** built on top of FIFO 
+("FIFO: Learning Fog-invariant Features for Foggy Scene Segmentation", CVPR 2022) 
+by Lee et al.
+
+**Original FIFO resources**: [Project Page](http://cvlab.postech.ac.kr/research/FIFO/) | [Paper](https://arxiv.org/abs/2204.01587)
+
+> Note: This is **not** the official FIFO repository. For the official implementation and pretrained models, please refer to the original project links above.
 
 > [FIFO: Learning Fog-invariant Features for Foggy Scene Segmentation](https://arxiv.org/abs/2204.01587)     
 > [Sohyun Lee](https://sohyun-l.github.io)<sup>1</sup>, Taeyoung Son<sup>2</sup>, [Suha Kwak](http://cvlab.postech.ac.kr/~suhakwak/)<sup>1</sup>\
 > POSTECH<sup>1</sup>, NALBI<sup>2</sup>\
 > accept to CVPR 2022 as an oral presentation 
+
+## Our improvement (summary)
+We implement and evaluate a Teacher--Student self-training pipeline (FixMatch/UniMatch-lite style): EMA teacher, weak→strong augmentation, and confidence-thresholded pseudo-label masking.
+
+### Best results (mIoU)
+The best run we obtained (vs. the provided FIFO final checkpoint) is:
+
+| Method | FZ | FDD | FD | Lindau |
+|---|---:|---:|---:|---:|
+| Baseline (FIFO, final) | 48.41 | 48.93 | 50.71 | 64.75 |
+| Ours (best run) | 49.70 | 49.75 | 50.99 | 64.99 |
+
+### Notebook
+- Please add your notebook link here: **[Kaggle/Colab notebook](PASTE_NOTEBOOK_URL_HERE)**
+- Or, if you add an `.ipynb` file into this repo (e.g., `notebooks/ablation.ipynb`), I can update this link to point to it.
 
 ![Overall_architecture](https://user-images.githubusercontent.com/57887512/161761968-436766d9-363d-463d-b8b3-f48ba2a2a949.png)
 
