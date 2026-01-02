@@ -25,8 +25,10 @@ The best run we obtained (vs. the provided FIFO final checkpoint) is:
 | Ours (best run) | 49.70 | 49.75 | 50.99 | 64.99 |
 
 ### Notebook
-- Please add your notebook link here: **[Kaggle/Colab notebook](PASTE_NOTEBOOK_URL_HERE)**
-- Or, if you add an `.ipynb` file into this repo (e.g., `notebooks/ablation.ipynb`), I can update this link to point to it.
+**[Kaggle notebook](https://www.kaggle.com/code/anhnguyen0812/fiifo-improve)**
+
+### Best checkpoint
+**[FIFO_Improvement_final](https://drive.google.com/file/d/1P6bRat_OQCNzMzMvWkqFr1y3ZoSveKBa/view?usp=drive_link)**
 
 ![Overall_architecture](https://user-images.githubusercontent.com/57887512/161761968-436766d9-363d-463d-b8b3-f48ba2a2a949.png)
 
