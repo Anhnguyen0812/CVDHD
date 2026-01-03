@@ -28,7 +28,7 @@ The best run we obtained (vs. the provided FIFO final checkpoint) is:
 **[Kaggle notebook](https://www.kaggle.com/code/anhnguyen0812/fiifo-improve)**
 
 ### Best checkpoint
-**[FIFO_Improvement_final](https://drive.google.com/file/d/1P6bRat_OQCNzMzMvWkqFr1y3ZoSveKBa/view?usp=drive_link)**
+**[FIFO_Improvement_final](https://drive.google.com/file/d/12p2RwUAenw7cKVZ0XwFWYLxJmn3BWqnL/view?usp=sharing)**
 
 ![Overall_architecture](https://user-images.githubusercontent.com/57887512/161761968-436766d9-363d-463d-b8b3-f48ba2a2a949.png)
 
